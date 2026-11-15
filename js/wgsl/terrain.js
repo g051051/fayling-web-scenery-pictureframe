@@ -3,6 +3,7 @@
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 import { FRAME_WGSL, NOISE_WGSL, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } from './common.js';
+import { PLANET_HEIGHT_WGSL } from '../planet-terrain.js';
 
 // Clipmap lookups for the render passes. The including module declares clipA, clipB (both
 // texture_2d_array<f32>), sampC (linear clamp sampler) and CL (ClipLevels). rgba32float
@@ -790,11 +791,15 @@ export const CLIP_HEIGHT = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 ` + BAKE_UNIFORM + /* wgsl */ `
 @group(0) @binding(2) var dst: texture_storage_2d_array<r32float, write>;
-` + NOISE_WGSL + TERRAIN_FUNCS + /* wgsl */ `
+` + NOISE_WGSL + TERRAIN_FUNCS + PLANET_HEIGHT_WGSL + /* wgsl */ `
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   if (id.x >= ${CLIP_RES}u || id.y >= ${CLIP_RES}u) { return; }
   let xz = B.origin + vec2f(id.xy) * B.texel;
+  if (F.body.x > 0.5) {
+    textureStore(dst, id.xy, u32(B.level), vec4f(planetHeight(xz), 0.0, 0.0, 0.0));
+    return;
+  }
   textureStore(dst, id.xy, u32(B.level), vec4f(terrainHeight(xz, B.texel), 0.0, 0.0, 0.0));
 }
 `;
@@ -833,6 +838,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
           / (f32(k * k) * tx * tx);
 
   let xz = B.origin + vec2f(id.xy) * tx;
+  if (F.body.x > 0.5) {
+    // These derivatives come from the spline-reconstructed height bake, so the
+    // lighting normals follow the smoothed geometry rather than raw DEM cells.
+    textureStore(dstA, id.xy, u32(B.level), vec4f(h, grad, lap));
+    textureStore(dstB, id.xy, u32(B.level), vec4f(0.0, 0.0, 1.0, 0.0));
+    return;
+  }
   let wl = waterLevel(xz.y);
   let above = h - wl;
   let slope = length(grad);
@@ -915,10 +927,11 @@ export const HEIGHT_PROBE = FRAME_WGSL + /* wgsl */ `
 struct Probe { p: array<vec4f, ${PROBE_N}> };
 @group(0) @binding(1) var<uniform> Q: Probe;
 @group(0) @binding(2) var<storage, read_write> outH: array<f32, ${PROBE_N}>;
-` + NOISE_WGSL + TERRAIN_FUNCS + /* wgsl */ `
+` + NOISE_WGSL + TERRAIN_FUNCS + PLANET_HEIGHT_WGSL + /* wgsl */ `
 @compute @workgroup_size(${PROBE_N})
 fn main(@builtin(local_invocation_index) k: u32) {
   let xz = Q.p[k].xy;
+  if (F.body.x > 0.5) { outH[k] = planetHeight(xz); return; }
   outH[k] = max(terrainHeight(xz, 4.0), waterLevel(xz.y));
 }
 `;
