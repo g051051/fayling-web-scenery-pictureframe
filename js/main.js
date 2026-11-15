@@ -298,22 +298,30 @@ async function main() {
   // first, then gradient / curvature / land-cover masks are derived from it.
   // --------------------------------------------------------------------------------------
   const mkClip = (format, label) => device.createTexture({
-    label, size: [CLIP_RES, CLIP_RES, CLIP_LEVELS], format, usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
+    label, size: [CLIP_RES, CLIP_RES, CLIP_LEVELS], format,
+    usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING | TU.COPY_SRC | TU.COPY_DST,
   });
   const clipH = mkClip('r32float', 'clip height');
   const clipA = mkClip('rgba32float', 'clip A');
   const clipB = mkClip('rgba16float', 'clip B');
+  // A texture cannot be copied onto itself, so a moved level's kept texels go through these.
+  const clipTex = [clipH, clipA, clipB];
+  const clipScratch = clipTex.map((t) => device.createTexture({
+    label: t.label + ' scratch', size: [CLIP_RES, CLIP_RES], format: t.format, usage: TU.COPY_SRC | TU.COPY_DST,
+  }));
   const arr = (t) => t.createView({ dimension: '2d-array' });
   const clipUBO = mkBuf(CLIP_LEVELS * 16, GU.UNIFORM | GU.COPY_DST, 'clip levels');
   const clipF = new Float32Array(CLIP_LEVELS * 4);
+  // Two bake slots per level: a level that moves diagonally uncovers one strip on each axis.
   const bakeUBOs = [], bgClipHeight = [], bgClipDerive = [];
-  for (let l = 0; l < CLIP_LEVELS; l++) {
-    const ubo = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bake ' + l);
+  for (let i = 0; i < CLIP_LEVELS * 2; i++) {
+    const ubo = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'bake ' + i);
     bakeUBOs.push(ubo);
-    bgClipHeight.push(bg(clipHeightPipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH)], 'clip height ' + l));
-    bgClipDerive.push(bg(clipDerivePipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH), arr(clipA), arr(clipB)], 'clip derive ' + l));
+    bgClipHeight.push(bg(clipHeightPipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH)], 'clip height ' + i));
+    bgClipDerive.push(bg(clipDerivePipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH), arr(clipA), arr(clipB)], 'clip derive ' + i));
   }
-  const bakeF = new Float32Array(4);
+  const bakeF = new Float32Array(12);
+  const bakeJobs = [];
   const clipOrigin = new Float64Array(CLIP_LEVELS * 2);
   const clipValid = new Uint8Array(CLIP_LEVELS);
   const clipTexel = (l) => CLIP_TEXEL0 * Math.pow(2, l);
@@ -676,8 +684,7 @@ async function main() {
     const t = new BigUint64Array(tsRead.getMappedRange());
     const ms = Number(t[3] - t[0]) / 1e6;
     if (ms > 0 && ms < 1000) {
-      const parts = [Number(t[1] - t[0]) / 1e6, Number(t[2] - t[1]) / 1e6, Number(t[3] - t[2]) / 1e6];
-      for (let i = 0; i < 3; i++) gpuSplit[i] = gpuSplit[i] ? gpuSplit[i] * 0.8 + parts[i] * 0.2 : parts[i];
+      const parts = [Number(t[1] - t[0]) / 1e6, Number(t[2] - t[1]) / 1e6, Number(t[3] - t[2]) / 1e6];      for (let i = 0; i < 3; i++) gpuSplit[i] = gpuSplit[i] ? gpuSplit[i] * 0.8 + parts[i] * 0.2 : parts[i];
     }
     if (paceFresh > 0) paceFresh--;
     else if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
@@ -1057,35 +1064,88 @@ async function main() {
   }
 
   // --------------------------------------------------------------------------------------
-  // Clipmap placement: each level is centred a little ahead of the camera and rebaked when
-  // the camera has moved a sixteenth of its span.
+  // Clipmap placement: each level is centred a little ahead of the camera and moved when
+  // the camera has moved a sixteenth of its span. A moved level slides the texels it still
+  // covers into place and bakes only the strips it has uncovered, about an eighth of the
+  // level, so a turn or a long glide no longer costs a full 512² bake.
   // --------------------------------------------------------------------------------------
-  function encodeClips(cp) {
+  // The derive pass reads up to this many texels away (curvature over 8 m at 2 m texels), so
+  // kept texels this close to a new strip are derived again: they sat on the old border.
+  const DERIVE_REACH = 4;
+  function queueBake(slot, l, ox, oz, t, hx, hy, hw, hh, dx, dy, dw, dh) {
+    bakeF[0] = ox; bakeF[1] = oz; bakeF[2] = t; bakeF[3] = l;
+    bakeF[4] = hx; bakeF[5] = hy; bakeF[6] = hw; bakeF[7] = hh;
+    bakeF[8] = dx; bakeF[9] = dy; bakeF[10] = dw; bakeF[11] = dh;
+    device.queue.writeBuffer(bakeUBOs[slot], 0, bakeF);
+    bakeJobs.push(slot, hw, hh, dw, dh);
+  }
+  function shiftClip(enc, l, sx, sz) {
+    const kw = CLIP_RES - Math.abs(sx), kh = CLIP_RES - Math.abs(sz);
+    const x0 = Math.max(0, -sx), z0 = Math.max(0, -sz);
+    const size = [kw, kh, 1];
+    for (let i = 0; i < clipTex.length; i++) {
+      enc.copyTextureToTexture(
+        { texture: clipTex[i], origin: { x: x0 + sx, y: z0 + sz, z: l } },
+        { texture: clipScratch[i], origin: { x: x0, y: z0 } }, size);
+      enc.copyTextureToTexture(
+        { texture: clipScratch[i], origin: { x: x0, y: z0 } },
+        { texture: clipTex[i], origin: { x: x0, y: z0, z: l } }, size);
+    }
+  }
+  function planClips(enc) {
     const fx = Math.sin(cam.yaw), fz = -Math.cos(cam.yaw);
-    // One level per frame. Rebaking several 512² maps in the same frame is a visible hitch.
+    const N = CLIP_RES, R = DERIVE_REACH;
+    bakeJobs.length = 0;
+    // One moved level per frame keeps the bake cost flat from frame to frame.
     let budget = 1;
     for (let l = 0; l < CLIP_LEVELS; l++) {
       const t = clipTexel(l);
-      const span = t * CLIP_RES;
+      const span = t * N;
       const snap = t * 16;
       const ox = Math.floor((cam.x + fx * span * 0.22 - span * 0.5) / snap) * snap;
       const oz = Math.floor((cam.z + fz * span * 0.22 - span * 0.5) / snap) * snap;
       const moved = Math.max(Math.abs(ox - clipOrigin[l * 2]), Math.abs(oz - clipOrigin[l * 2 + 1]));
       if (clipValid[l] && (moved < span / 16 || budget <= 0)) continue;
+      const sx = Math.round((ox - clipOrigin[l * 2]) / t);
+      const sz = Math.round((oz - clipOrigin[l * 2 + 1]) / t);
       if (clipValid[l]) budget--;
+      if (!clipValid[l] || Math.abs(sx) >= N || Math.abs(sz) >= N) {
+        queueBake(l * 2, l, ox, oz, t, 0, 0, N, N, 0, 0, N, N);
+      } else {
+        shiftClip(enc, l, sx, sz);
+        const ax = Math.abs(sx), az = Math.abs(sz);
+        if (ax) {
+          const x = sx > 0 ? N - ax : 0;
+          const dx = sx > 0 ? Math.max(0, x - R) : 0;
+          const dw = sx > 0 ? N - dx : Math.min(N, ax + R);
+          queueBake(l * 2, l, ox, oz, t, x, 0, ax, N, dx, 0, dw, N);
+        }
+        if (az) {
+          const z = sz > 0 ? N - az : 0;
+          const dz = sz > 0 ? Math.max(0, z - R) : 0;
+          const dh = sz > 0 ? N - dz : Math.min(N, az + R);
+          queueBake(l * 2 + 1, l, ox, oz, t, Math.max(0, -sx), z, N - ax, az, 0, dz, N, dh);
+        }
+      }
       clipOrigin[l * 2] = ox; clipOrigin[l * 2 + 1] = oz;
       clipValid[l] = 1;
-      bakeF[0] = ox; bakeF[1] = oz; bakeF[2] = t; bakeF[3] = l;
-      device.queue.writeBuffer(bakeUBOs[l], 0, bakeF);
       clipF[l * 4] = ox; clipF[l * 4 + 1] = oz; clipF[l * 4 + 2] = t; clipF[l * 4 + 3] = 0;
-      cp.setPipeline(clipHeightPipe);
-      cp.setBindGroup(0, bgClipHeight[l]);
-      cp.dispatchWorkgroups(CLIP_RES / 8, CLIP_RES / 8);
-      cp.setPipeline(clipDerivePipe);
-      cp.setBindGroup(0, bgClipDerive[l]);
-      cp.dispatchWorkgroups(CLIP_RES / 8, CLIP_RES / 8);
     }
     device.queue.writeBuffer(clipUBO, 0, clipF);
+  }
+  // Every height strip is baked before any derive pass reads across it.
+  function encodeClips(cp) {
+    if (!bakeJobs.length) return;
+    cp.setPipeline(clipHeightPipe);
+    for (let i = 0; i < bakeJobs.length; i += 5) {
+      cp.setBindGroup(0, bgClipHeight[bakeJobs[i]]);
+      cp.dispatchWorkgroups(Math.ceil(bakeJobs[i + 1] / 8), Math.ceil(bakeJobs[i + 2] / 8));
+    }
+    cp.setPipeline(clipDerivePipe);
+    for (let i = 0; i < bakeJobs.length; i += 5) {
+      cp.setBindGroup(0, bgClipDerive[bakeJobs[i]]);
+      cp.dispatchWorkgroups(Math.ceil(bakeJobs[i + 3] / 8), Math.ceil(bakeJobs[i + 4] / 8));
+    }
   }
 
   // --------------------------------------------------------------------------------------
@@ -3351,6 +3411,7 @@ async function main() {
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
     const enc = device.createCommandEncoder();
+    planClips(enc);
     const cp = enc.beginComputePass(computeDesc);
     if (needLUT) {
       atmoF[0] = P.haze;
