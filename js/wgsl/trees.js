@@ -3,6 +3,10 @@
 // (cheap crown) that two indirect draws consume. Every tree is real geometry at every distance,
 // so flying forward never grows or inserts a tree; a crown that shrinks below a pixel is only
 // recoloured towards the stand colour the ground already carries.
+//
+// Near crowns are not cones. A fir is a pointed skirt with a shallow branch notch and a
+// ragged outline; a broadleaf is a lobed dome, and in the open it sits on a stem. Juniper
+// is a low cushion. The far list stays a cone, with the same stem, and fades to the stand.
 import { FRAME_WGSL, ATMO_CORE_WGSL, NOISE_WGSL, AP_RES, AP_MAX_KM,
   TREE_RANGE, TREE_NEAR_DIST, TREE_MAX, TREE_NEAR_MAX } from './common.js';
 import { SKY_RENDER_FUNCS } from './sky.js';
@@ -13,10 +17,15 @@ import { RAIN_STRUCT } from './rain.js';
 export const TREE_INST_BYTES = 80;
 export const TREE_GEN_GROUP = 8;
 export const TREE_SEGS_NEAR = 12;
+export const TREE_RINGS_NEAR = 6;
+export const TREE_TRUNK_SIDES = 6;
 export const TREE_SEGS_FAR = 6;
-// vertices per crown: an apex fan and a shoulder-to-base band near, a single fan far
-export const TREE_VERTS_NEAR = TREE_SEGS_NEAR * 9;
-export const TREE_VERTS_FAR = TREE_SEGS_FAR * 3;
+// near: four bands of the crown shell, plus a six-sided stem
+const TREE_CROWN_TRIS_NEAR = (TREE_RINGS_NEAR - 1) * TREE_SEGS_NEAR * 2;
+const TREE_TRUNK_TRIS_NEAR = TREE_TRUNK_SIDES * 2;
+export const TREE_VERTS_NEAR = (TREE_CROWN_TRIS_NEAR + TREE_TRUNK_TRIS_NEAR) * 3;
+// far: a cone fan plus a camera-facing stem quad
+export const TREE_VERTS_FAR = (TREE_SEGS_FAR + 2) * 3;
 
 const TREE_CONSTS = /* wgsl */ `
 const TREE_RANGE: f32 = ${TREE_RANGE}.0;
@@ -25,7 +34,11 @@ const TREE_MAX: u32 = ${TREE_MAX}u;
 const TREE_NEAR_MAX: u32 = ${TREE_NEAR_MAX}u;
 const EARTH_R: f32 = 6371000.0;
 const TREE_SEGS_NEAR: u32 = ${TREE_SEGS_NEAR}u;
+const TREE_RINGS_NEAR: u32 = ${TREE_RINGS_NEAR}u;
+const TREE_TRUNK_SIDES: u32 = ${TREE_TRUNK_SIDES}u;
 const TREE_SEGS_FAR: u32 = ${TREE_SEGS_FAR}u;
+const NEAR_CROWN_TRIS: u32 = ${TREE_CROWN_TRIS_NEAR}u;
+const NEAR_TRUNK_TRIS: u32 = ${TREE_TRUNK_TRIS_NEAR}u;
 struct TreeInst {
   a: vec4f,   // xyz = ground position of the trunk, w = crown radius
   b: vec4f,   // x = apex height, y = lowest crown edge, z = texture seed, w = 1 for conifers
@@ -227,9 +240,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 `;
 }
 
-// Crowns. The near list is a twelve-sided cone in three rings (apex, shoulder, base), the far
-// list a single six-triangle fan. Both are shaded from the same analytic cone or dome the old
-// per-pixel crowns used.
+// Crowns. Near trees are a twelve-sided shell: a fir with a branch notch and a ragged skirt,
+// a lobed broadleaf dome on a stem, or a juniper cushion. The far list is a cone plus a stem.
+// Both are shaded from the shell normal, with leaf clumps and light through the foliage.
 export function treeDrawWGSL() {
   return FRAME_WGSL + ATMO_CORE_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -247,14 +260,73 @@ struct VOut {
   @builtin(position) pos: vec4f,
   @location(0) rel: vec3f,
   @location(1) dv: vec2f,
-  @location(2) @interpolate(flat) ti: u32,
+  @location(2) nrm: vec3f,
+  @location(3) bark: f32,
+  @location(4) yFrac: f32,
+  @location(5) crownU: f32,
+  @location(6) @interpolate(flat) ti: u32,
 };
+
+// (radius fraction, height fraction). Height is 1 at the apex and 0 at the crown base.
+// The shell stays close to a soft cone or dome. Deep notches read as low-poly spikes
+// from the air; the foliage break-up is done in the shading instead.
+fn crownKnot(ring: u32, conifer: bool, open: f32, trop: f32, juniper: bool) -> vec2f {
+  let s = f32(ring) * (1.0 / f32(TREE_RINGS_NEAR - 1u));
+  if (juniper) {
+    let z = s * 2.7;
+    return vec2f(sin(min(z, 3.0)) * select(1.0, 0.85, s > 0.92), pow(1.0 - s, 1.25));
+  }
+  if (conifer) {
+    // Fuller than a straight triangle. The skirt tucks in at the bottom so the
+    // trunk shows under the branches instead of the foliage planting itself in the ground.
+    let cone = pow(max(s, 0.0), 0.72);
+    let tuck = mix(1.0, 0.58, smoothstep(0.58, 1.0, s));
+    let scallop = 0.045 * sin(s * 12.566);
+    return vec2f(cone * tuck * (1.0 + scallop), 1.0 - pow(s, 0.95));
+  }
+  // Closed stands stay wide where neighbours meet. An open crown is a spreading
+  // oak, wider than it is tall, pinching onto the stem. A sphere on a pole reads as a toy.
+  let o = max(open, trop);
+  // Closed: the old wide paraboloid, so neighbouring crowns still make one canopy.
+  let dome = sqrt(max(s, 0.0));
+  let spread = sin(3.14159265 * pow(max(s, 0.0), 0.58));
+  let z = 0.03 + 0.97 * s;
+  var ell = sqrt(max(1.0 - pow(2.0 * z - 1.02, 2.0), 0.0));
+  if (trop > 0.01) {
+    let zt = pow(s, mix(1.0, 0.62, trop));
+    let umb = sqrt(max(1.0 - pow(2.0 * zt - 1.12, 2.0), 0.0));
+    ell = mix(ell, max(umb, ell * 0.9), trop);
+  }
+  let rounded = mix(ell, spread, 0.65);
+  let rad = mix(dome, rounded, o) * smoothstep(0.0, 0.14, s);
+  let h = mix(1.0 - s, 1.0 - pow(s, mix(1.65, 1.85, trop)), o);
+  return vec2f(rad, h);
+}
+
+fn crownOutline(a: f32, seed: f32, ring: u32, conifer: bool, open: f32, juniper: bool) -> f32 {
+  let n1 = sin(a * 2.0 + seed * 0.11 + f32(ring) * 0.4);
+  let n2 = sin(a * 5.0 + seed * 0.07 + f32(ring));
+  if (conifer) { return clamp(1.0 + n1 * 0.07 + n2 * 0.04, 0.88, 1.12); }
+  if (juniper) { return clamp(1.0 + n1 * 0.07 + n2 * 0.04, 0.86, 1.12); }
+  return clamp(1.0 + n1 * mix(0.14, 0.22, open) + n2 * 0.06, 0.72, 1.22);
+}
+
+// Perpendicular of a chord on the crown shell, in (radial, up).
+fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
+  let dRad = (q.x - p.x) * crownR;
+  let dY = (q.y - p.y) * span;
+  return vec3f(cos(ang) * (-dY), dRad, sin(ang) * (-dY));
+}
 
 @vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
   var o: VOut;
   o.pos = vec4f(2.0, 2.0, 2.0, 1.0);   // outside the clip volume: the triangle is discarded
   o.rel = vec3f(0.0);
   o.dv = vec2f(0.0);
+  o.nrm = vec3f(0.0, 1.0, 0.0);
+  o.bark = 0.0;
+  o.yFrac = 0.0;
+  o.crownU = 0.0;
   o.ti = 0u;
   var ti = ii;
   if (FAR) {
@@ -267,116 +339,243 @@ struct VOut {
   let top = I.b.x;
   let base = I.b.y;
   let conifer = I.b.w > 0.5;
-  let span = max(top - base, 0.5);
+  let spanH = max(top - base, 0.2);
   let centre = vec3f(I.a.x, I.a.y, I.a.z);
   // True crown radius at every distance. Enlarging small crowns to a minimum pixel size
-  // made them shrink back to their real width as the camera approached, a ripple of
-  // growing and shrinking that travelled through the forest.
+  // made them shrink back to their real width as the camera approached.
   let r = I.a.w;
-
+  let seed = I.b.z;
+  let open = 1.0 - smoothstep(0.12, 0.42, I.c.z);
+  let trop = F.biome.w;
+  let juniper = F.mist.z > 0.5;
+  let lean = vec2f(cos(seed * 0.21), sin(seed * 0.17)) * min(top * 0.05, 2.2);
+  let trunkR = clamp(top * 0.016, 0.16, 0.72);
   let tri = vi / 3u;
   let k = vi % 3u;
-  var ring = 0u;     // 0 apex, 1 shoulder, 2 base
-  var si = 0u;
-  let segs = select(TREE_SEGS_NEAR, TREE_SEGS_FAR, FAR);
+
+  var world = centre;
+  var dv = vec2f(0.0);
+  var nrm = vec3f(0.0, 1.0, 0.0);
+  var bark = 0.0;
+  var yAbs = 0.0;
+  var crownU = 1.0;
+  var live = false;
+
   if (FAR) {
-    if (k > 0u) { ring = 2u; si = tri + k - 1u; }
-  } else if (tri < segs) {
-    if (k > 0u) { ring = 1u; si = tri + k - 1u; }
-  } else {
-    let q = tri - segs;
-    let i = q >> 1u;
-    if ((q & 1u) == 0u) {
-      if (k == 0u) { ring = 1u; si = i; } else { ring = 2u; si = i + select(0u, 1u, k == 2u); }
-    } else {
-      if (k == 0u) { ring = 1u; si = i; } else if (k == 1u) { ring = 2u; si = i + 1u; } else { ring = 1u; si = i + 1u; }
+    if (tri < TREE_SEGS_FAR) {
+      live = true;
+      var si = tri;
+      if (k > 0u) { si = tri + k - 1u; }
+      let s = select(0.0, 1.0, k > 0u);
+      let a = f32(si % TREE_SEGS_FAR) * (6.2831853 / f32(TREE_SEGS_FAR)) + seed * 0.37;
+      let jr = 1.0 + 0.10 * sin(a * 3.0 + seed * 0.13);
+      let rad = s * r * 1.0996 * jr;
+      yAbs = mix(top, base, s);
+      let horiz = vec2f(cos(a), sin(a)) * rad + lean * (yAbs / max(top, 0.5));
+      world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
+      dv = horiz;
+      let Rbase = r * 1.0996 * jr;
+      let slope = vec3f(cos(a) * (top - base), Rbase, sin(a) * (top - base));
+      let slen = length(slope);
+      if (slen < 1e-4) { nrm = vec3f(0.0, 1.0, 0.0); } else { nrm = slope / slen; }
+      crownU = 1.0 - s;
+    } else if (base > 1.15 && !juniper) {
+      live = true;
+      let ft = tri - TREE_SEGS_FAR;
+      let second = (ft & 1u) == 1u;
+      var corner = k;
+      if (second) { corner = select(0u, k + 1u, k > 0u); }
+      let topC = corner >= 2u;
+      yAbs = select(0.0, min(base + spanH * 0.05, top * 0.96), topC);
+      let midY = base * 0.45;
+      let mid = vec3f(centre.x, centre.y, centre.z) + vec3f(lean.x, 0.0, lean.y) * (midY / max(top, 0.5)) + vec3f(0.0, midY, 0.0);
+      let eye = F.camPos.xyz - mid;
+      let axis = vec3f(lean.x, max(top, 1.0), lean.y);
+      var side = cross(axis, eye);
+      if (length(side) < 1e-2) { side = vec3f(1.0, 0.0, 0.0); } else { side = normalize(side); }
+      let positive = corner == 1u || corner == 2u;
+      let sgn = select(-1.0, 1.0, positive);
+      let hw = trunkR * select(1.35, 0.7, topC);
+      let p = vec3f(centre.x, centre.y + yAbs, centre.z) + vec3f(lean.x, 0.0, lean.y) * (yAbs / max(top, 0.5));
+      world = p + side * hw * sgn;
+      dv = vec2f(sgn * hw, yAbs);
+      let eh = vec3f(eye.x, 0.22 * length(eye.xz), eye.z);
+      if (length(eh) < 1e-3) { nrm = vec3f(0.0, 1.0, 0.0); } else { nrm = normalize(eh); }
+      bark = 1.0;
+      crownU = 0.0;
     }
+  } else if (tri < NEAR_CROWN_TRIS) {
+    live = true;
+    let bandTris = TREE_SEGS_NEAR * 2u;
+    let band = tri / bandTris;
+    let bt = tri % bandTris;
+    let seg = bt / 2u;
+    let second = (bt & 1u) == 1u;
+    var ring = band;
+    var si = seg;
+    if (!second) {
+      if (k == 0u) { ring = band; si = seg; }
+      else if (k == 1u) { ring = band + 1u; si = seg; }
+      else { ring = band + 1u; si = seg + 1u; }
+    } else {
+      if (k == 0u) { ring = band; si = seg; }
+      else if (k == 1u) { ring = band + 1u; si = seg + 1u; }
+      else { ring = band; si = seg + 1u; }
+    }
+    let a = f32(si % TREE_SEGS_NEAR) * (6.2831853 / f32(TREE_SEGS_NEAR)) + seed * 0.37 + f32(ring) * 0.47;
+    let shape = crownKnot(ring, conifer, open, trop, juniper);
+    let jr = crownOutline(a, seed, ring, conifer, open, juniper);
+    let rad = shape.x * r * jr * 1.023;
+    yAbs = base + shape.y * (top - base);
+    var horiz = vec2f(cos(a), sin(a)) * rad + lean * (yAbs / max(top, 0.5));
+    if (conifer && ring <= 1u) {
+      horiz += vec2f(cos(seed * 0.9), sin(seed * 0.9)) * r * 0.04 * select(1.0, 0.45, ring == 1u);
+    }
+    world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
+    dv = horiz;
+    var acc = vec3f(0.0);
+    let shellR = r * jr * 1.023;
+    if (ring > 0u) { acc += knotDelta(crownKnot(ring - 1u, conifer, open, trop, juniper), shape, a, shellR, top - base); }
+    if (ring + 1u < TREE_RINGS_NEAR) { acc += knotDelta(shape, crownKnot(ring + 1u, conifer, open, trop, juniper), a, shellR, top - base); }
+    if (length(acc) < 1e-3) { nrm = vec3f(0.0, 1.0, 0.0); } else { nrm = normalize(acc); }
+    crownU = shape.y;
+  } else if (base > 1.15 && !juniper) {
+    live = true;
+    let ttri = tri - NEAR_CROWN_TRIS;
+    let side = ttri / 2u;
+    let second = (ttri & 1u) == 1u;
+    var corner = k;
+    if (second) { corner = select(0u, k + 1u, k > 0u); }
+    let topC = corner >= 2u;
+    let useA1 = corner == 1u || corner == 2u;
+    let stepA = 6.2831853 / f32(TREE_TRUNK_SIDES);
+    let a0 = (f32(side) + seed * 0.013) * stepA;
+    let ang = select(a0, a0 + stepA, useA1);
+    let am = a0 + stepA * 0.5;
+    yAbs = select(0.0, min(base + spanH * 0.04, top * 0.97), topC);
+    let radT = trunkR * select(1.32, 0.6, topC);
+    let horiz = vec2f(cos(ang), sin(ang)) * radT + lean * (yAbs / max(top, 0.5));
+    world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
+    dv = horiz;
+    nrm = normalize(vec3f(cos(am), 0.14, sin(am)));
+    bark = 1.0;
+    crownU = 0.0;
   }
-  // normalised radius and the crown height there
-  var u = 0.0;
-  if (ring == 1u) { u = select(0.62, 0.5, conifer); }
-  if (ring == 2u) { u = 1.0; }
-  var y = top;
-  if (ring > 0u) {
-    y = select(base + span * (1.0 - u * u), top - span * pow(u, 0.85), conifer);
-  }
-  let seed = I.b.z;
-  let a = f32(si % segs) * (6.2831853 / f32(segs)) + seed * 0.37;
-  // A polygon with the area of the round crown. Trimming a larger one to the circle in the
-  // fragment shader (discard) turned off early depth testing, and every crown hidden behind
-  // the first one was shaded as well.
-  let rad = u * r * select(1.023, 1.0996, FAR);
-  let dv = vec2f(cos(a), sin(a)) * rad;
-  var rel = vec3f(centre.x + dv.x, centre.y + y, centre.z + dv.y) - F.camPos.xyz;
+
+  if (!live) { return o; }
+  var rel = world - F.camPos.xyz;
   rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
   o.rel = rel;
   o.pos = F.viewProj * vec4f(rel, 1.0);
   o.dv = dv;
+  o.nrm = nrm;
+  o.bark = bark;
+  o.yFrac = yAbs / max(top, 0.5);
+  o.crownU = crownU;
   o.ti = ti;
   return o;
 }
 
+fn shadeSurface(alb: vec3f, nIn: vec3f, V: vec3f, lt: Light, shade: f32, ao: f32, transK: f32, specK: f32, rough: f32) -> vec3f {
+  var n = nIn;
+  let nlen = length(n);
+  // A NaN length fails the comparison, so the test is inverted.
+  if (!(nlen > 1e-4)) { n = vec3f(0.0, 1.0, 0.0); } else { n = n / nlen; }
+  // A normal that faces the camera by a hair more than 1 makes pow() return NaN.
+  // Those pixels survive the bloom chain and show up as white spots in the sky.
+  let ndv = clamp(dot(n, V), -1.0, 1.0);
+  if (ndv < 0.0) { n = -n; }
+  let facing = abs(ndv);
+  let back = ndv < 0.0;
+  let sunHit = max(dot(n, lt.L), 0.0) * select(1.0, 0.22, back);
+  let moonHit = max(dot(n, lt.M), 0.0);
+  let rim = pow(clamp(1.0 - facing, 0.0, 1.0), 1.8);
+  let trans = transK * max(-dot(n, lt.L), 0.0) * (0.28 + 0.72 * rim);
+  let Hl = V + lt.L;
+  let Hlen = length(Hl);
+  var spec = 0.0;
+  if (Hlen > 1e-4 && specK > 0.0) {
+    let nh = clamp(dot(n, Hl / Hlen), 0.0, 1.0);
+    spec = specK * ggx(nh, max(rough, 0.08)) * sunHit / max(facing, 0.2);
+  }
+  let amb = ambient(lt, n) * ao * select(1.0, 0.5, back);
+  return (alb * (lt.sun * shade * (sunHit + trans) + lt.moon * moonHit + amb)
+       + lt.sun * shade * spec * PI) * (1.0 / PI);
+}
+
 @fragment fn fs(in: VOut) -> @location(0) vec4f {
   let I = trees[in.ti];
-  let fp = max(length(dpdx(in.dv)), length(dpdy(in.dv)));
-  let dist = length(in.rel);
+  let dist = max(length(in.rel), 0.05);
   let V = -in.rel / dist;
   let conifer = I.b.w > 0.5;
   let top = I.b.x;
-  let base = I.b.y;
   let r = I.a.w;
-  let span = max(top - base, 0.5);
+  let seed = I.b.z;
   let sunVis = I.c.x;
   let cloudSu = I.c.y;
   let dens = I.c.z;
   var lt = readLight();
 
-  // how much of this crown is still a crown: below a pixel it is the stand colour
-  let kS = smoothstep(0.6, 2.2, fp / max(r, 0.1));
+  // Below a pixel the crown is the stand colour the ground already carries.
+  let mpp = max(length(dpdx(in.rel)), length(dpdy(in.rel)));
+  let kS = smoothstep(0.55 * r, 2.3 * r, mpp);
   var col = I.d.xyz;
-  let d = max(length(in.dv), 1e-3);
   if (kS < 0.999) {
-    let x = clamp(d / r, 0.02, 1.0);
-    var yc: f32;
-    var dydd: f32;
-    if (conifer) {
-      let px = pow(x, 0.85);
-      yc = top - span * px;
-      dydd = -span * 0.85 * px / (x * r);
-    } else {
-      yc = base + span * (1.0 - x * x);
-      dydd = -span * 2.0 * x / r;
-    }
-    let cg = in.dv / d * dydd;
-    // crown texture: branch tufts on conifers, lumpy foliage clusters on broadleaves
-    let kd = 1.0 - smoothstep(0.08 * r, 0.45 * r, fp);
-    let bf = 1.0 / (r * select(0.3, 0.22, conifer));
-    let arc = d + max(top - yc, 0.0) * 0.8;
-    let q = in.dv * (arc / d) * bf + vec2f(I.b.z * 1.37, I.b.z * 0.71);
-    var b1 = vec3f(0.0);
-    var b2 = vec3f(0.0);
-    if (kd > 0.01) {
-      b1 = gnoised(q);
-      b2 = gnoised(q * 2.3 + vec2f(5.1, 2.7));
-    }
-    let amp = span * select(0.16, 0.10, conifer) * kd;
-    let bump = (b1.yz + b2.yz * 2.3 * 0.5) * bf * amp;
-    let gw = cg + bump;
-    let nC = normalize(vec3f(-gw.x, 1.0, -gw.y));
-    let yb = yc + (b1.x + b2.x * 0.5) * amp;
-    let depthK = clamp((yb - base) / max(span, 1.0), 0.0, 1.0);
-    let ao = (0.45 + 0.55 * depthK) * clamp(1.0 + (b1.x + 0.5 * b2.x) * 0.8 * kd, 0.5, 1.2);
-    // a closed stand shades its lower crowns
+    let yAbs = in.yFrac * top;
     let sunk = smoothstep(-0.02, 0.35, lt.L.y);
-    let shDepth = smoothstep(max(F.forest.z, 1.0) * 0.95, max(F.forest.z, 1.0) * 0.2, yb) * smoothstep(0.05, 0.5, dens);
-    let sh = select(1.0, clamp(1.0 - shDepth * mix(0.78, 0.34, sunk), 0.0, 1.0), dens > 0.004);
-    let alb = I.e.xyz;
-    let trans = select(0.35, 0.18, conifer) * max(-dot(nC, lt.L), 0.0) * (1.0 - depthK * 0.6);
-    let Hs = normalize(V + lt.L);
-    let spec = select(0.010, 0.005, conifer) * ggx(max(dot(nC, Hs), 0.0), 0.5) * max(dot(nC, lt.L), 0.0)
-             / max(dot(nC, V), 0.2);
-    let own = (alb * (direct(lt, nC, sh * sunVis) + lt.sun * sh * sunVis * trans + ambient(lt, nC) * ao)
-             + lt.sun * sh * sunVis * spec * PI) * (1.0 / PI);
+    let shDepth = smoothstep(max(F.forest.z, 1.0) * 0.95, max(F.forest.z, 1.0) * 0.18, yAbs) * smoothstep(0.05, 0.5, dens);
+    let sh = select(1.0, clamp(1.0 - shDepth * mix(0.82, 0.36, sunk), 0.0, 1.0), dens > 0.004);
+    let kd = 1.0 - smoothstep(0.05 * r, 0.42 * r, mpp);
+    var n = in.nrm;
+    if (length(n) < 1e-4) { n = vec3f(0.0, 1.0, 0.0); } else { n = normalize(n); }
+    var own = vec3f(0.0);
+    if (in.bark > 0.5) {
+      let ang = atan2(in.dv.y, in.dv.x);
+      let g = snoise(vec2f(ang * 2.2 + seed * 0.01, yAbs * 1.6));
+      let ridge = snoise(vec2f(ang * 8.0, yAbs * 3.2 + seed));
+      var barkC = select(vec3f(0.072, 0.054, 0.038), vec3f(0.064, 0.038, 0.024), conifer);
+      barkC *= 0.78 + 0.30 * (0.5 + 0.5 * g);
+      barkC *= mix(0.58, 1.0, smoothstep(-0.3, 0.6, ridge));
+      if (F.biome.w > 0.5 || F.forest.z > 36.0) {
+        let moss = smoothstep(0.28, 0.02, in.yFrac) * (0.35 + 0.65 * max(g, 0.0));
+        barkC = mix(barkC, vec3f(0.016, 0.034, 0.015), moss * 0.8);
+      }
+      let aoB = mix(0.48, 1.0, smoothstep(0.0, 0.45, in.yFrac));
+      own = shadeSurface(barkC, n, V, lt, sh * sunVis * 0.85, aoB, 0.0, 0.004, 0.72);
+    } else {
+      if (kd > 0.03) {
+        let ang = atan2(in.dv.y, in.dv.x);
+        let q = vec2f(ang * select(0.7, 1.1, conifer) + length(in.dv) * 0.08, in.crownU * select(1.8, 2.6, conifer));
+        let q2 = q + vec2f(seed * 0.017, seed * 0.008);
+        let b1 = gnoised(q2);
+        var side = vec3f(-in.dv.y, 0.0, in.dv.x);
+        if (length(side) < 1e-3) { side = vec3f(1.0, 0.0, 0.0); } else { side = normalize(side); }
+        let amp = select(0.38, 0.5, conifer) * kd;
+        let bumped = n + side * b1.y * amp + vec3f(0.0, 1.0, 0.0) * b1.x * amp * 0.25;
+        let blen = length(bumped);
+        if (!(blen > 1e-4)) { n = vec3f(0.0, 1.0, 0.0); } else { n = bumped / blen; }
+      }
+      var alb = I.e.xyz;
+      let x = clamp(length(in.dv) / max(r, 0.3), 0.0, 1.35);
+      if (kd > 0.02) {
+        let ang = atan2(in.dv.y, in.dv.x);
+        let cl = snoise(vec2f(ang * 0.55, in.crownU * 1.6) + vec2f(seed * 0.02, 1.7));
+        let cl2 = snoise(vec2f(ang * 1.4 + x, in.crownU * 2.6) + vec2f(4.0, seed * 0.01));
+        alb *= 1.0 + 0.2 * cl + 0.1 * cl2;
+      }
+      // A little darker toward the stem. Kept mild: a strong dark base reads as a hole
+      // in the canopy and breaks a closed stand into separate caps.
+      alb *= mix(0.9, 1.04, smoothstep(0.0, 0.75, in.crownU));
+      if (conifer) {
+        alb *= mix(0.9, 1.05, smoothstep(0.05, 0.85, x));
+      } else {
+        alb *= mix(0.92, 1.03, smoothstep(0.0, 0.7, x));
+      }
+      let ao = (0.5 + 0.5 * in.crownU) * mix(0.78, 1.05, smoothstep(-0.2, 0.65, n.y));
+      let transK = select(0.26, 0.48, conifer);
+      let specK = select(0.015, 0.005, conifer);
+      own = shadeSurface(alb, n, V, lt, sh * sunVis, clamp(ao, 0.35, 1.15), transK, specK, select(0.46, 0.6, conifer));
+    }
     col = mix(own, col, kS);
   }
   col *= mix(1.0, 0.72, Rain.amt.x);
@@ -416,6 +615,8 @@ struct VOut {
   let ap = textureSampleLevel(apTex, sampC, vec3f(uv, (max(zc, 0.0) + 0.5) / AP_N), 0.0);
   let T = mix(1.0, ap.a, w);
   col = col * T + ap.rgb * F.sunDir.w * w;
+  // max() with a finite value replaces NaN, so a bad leaf never blooms into a sky spot.
+  col = min(max(col, vec3f(0.0)), vec3f(64.0));
   return vec4f(col, 1.0);
 }
 `;
