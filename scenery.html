@@ -1416,8 +1416,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
 
 // ---- js/wgsl/terrain.js ----
-// Procedural landscape: eroded mountains, a meandering river valley, a one-sided coastline,
-// a plateau canyon, hanging waterfalls, lake basins, and the vegetation / rock / snow masks that go with them. The height function is baked into
+// Procedural landscape: eroded mountains, a meandering river valley, wooded hills on the
+// forest floor, a one-sided coastline, a plateau canyon, hanging waterfalls, lake basins,
+// and the vegetation / rock / snow masks that go with them. The height function is baked into
 // camera-centred clipmaps (one 512² layer per level, texel doubling per level) and the
 // renderer samples those instead of re-evaluating the noise per pixel.
 
@@ -1749,6 +1750,9 @@ fn coastHeight(xz: vec2f, texel: f32, m: f32, wl: f32) -> f32 {
   if (k < 0.55 && texel < 48.0) {
     hLand += snoise(xz * (1.0 / 95.0) + vec2f(2.0, 6.0)) * 0.65 * (1.0 - rise) * smoothstep(0.4, 2.2, hShore);
   }
+  // Beaches and cliff faces stay smooth. The forest behind them sits on hills.
+  let wooded = smoothstep(0.2, 0.72, rise) * (1.0 - smoothstep(0.58, 0.9, m) * 0.7);
+  if (wooded > 0.02) { hLand += woodedRelief(xz, texel) * wooded; }
   return wl + hLand + micro * mix(0.15, 1.0, rise);
 }
 
@@ -1874,6 +1878,10 @@ fn canyonHeight(xz: vec2f, texel: f32, wl: f32) -> f32 {
   let scale = max(F.relief.z, 400.0);
   let roll = snoise(xz / scale) * 48.0 + snoise(xz / (scale * 0.36) + vec2f(4.0, 2.0)) * 18.0;
   var h = wl + depth * frac + roll * smoothstep(0.82, 1.0, frac);
+  // The plateau above the rim is where the pinyon stands. Keep it off the walls:
+  // the mask starts only once the cross-section is already at the top.
+  let rimFlat = smoothstep(0.97, 0.998, frac);
+  if (rimFlat > 0.02) { h += woodedRelief(xz, texel) * rimFlat * 0.34; }
   if (texel < 20.0) {
     let rough = smoothstep(0.2, 0.45, frac) * (1.0 - smoothstep(0.9, 1.01, frac));
     h += snoise(vec2f(z * 0.02, frac * 8.0 + side)) * 4.0 * rough;
@@ -2049,6 +2057,77 @@ fn rimFeed(xz: vec2f) -> Feed {
   return o;
 }
 
+// Hills and swales for the ground the trees stand on.
+// The mountain field flattens its lows, and the valley cut flattens them again, so a
+// forest built on that alone sits on a plane. These are rounded foothills a few
+// hundred metres across, tall enough that the canopy rises and falls, and shallow
+// in the draws so a swale does not become a new lake. Octaves the clipmap texel
+// cannot resolve fade out, as in mountainField.
+fn softenLow(m: f32) -> f32 {
+  if (m >= 0.0) { return m; }
+  return m / (1.0 + (-m) * 0.14);
+}
+
+fn woodedRelief(xz: vec2f, texel: f32) -> f32 {
+  let spacing = clamp(F.relief.z * 0.05, 240.0, 520.0);
+  let steep = clamp(F.relief.w, 0.0, 1.0);
+  // Metres for one unit of noise on the main octave. Noise runs about ±0.5,
+  // which puts the crest-to-draw of those hills near 70–120 m.
+  let hill = mix(78.0, 120.0, steep);
+  if (texel > spacing * 2.8) { return 0.0; }
+
+  // A mild, slowly turning grain, then a warp, so the rolls are not a grid.
+  let dirN = snoise(xz / (spacing * 7.0) + vec2f(1.6, 5.4));
+  let ang = dirN * 0.85;
+  let ca = cos(ang);
+  let sa = sin(ang);
+  let along = vec2f(ca, sa);
+  let across = vec2f(-sa, ca);
+  var p = along * dot(xz, along) / (spacing * 1.12)
+        + across * dot(xz, across) / spacing;
+  p += vec2f(
+    snoise(p * 0.5 + vec2f(2.4, 8.1)),
+    snoise(p * 0.5 + vec2f(7.7, 1.5))
+  ) * 0.7;
+
+  var h = 0.0;
+  var freq = 1.0;
+  var gain = 1.0;
+  var q = p;
+  for (var i = 0; i < 4; i++) {
+    let wl = spacing / freq;
+    let keep = smoothstep(1.15 * texel, 2.9 * texel, wl);
+    if (keep < 0.001) { break; }
+    h += gain * snoise(q) * keep;
+    gain *= 0.46;
+    freq *= 2.04;
+    q = mat2x2f(0.8, -0.6, 0.6, 0.8) * q * 2.04 + vec2f(4.1, 2.2);
+  }
+  // The low ground wanders, so neighbouring swales do not share one elevation.
+  let floorWl = spacing * 2.5;
+  let floorKeep = smoothstep(1.15 * texel, 2.9 * texel, floorWl);
+  let wander = snoise(xz / floorWl + vec2f(3.3, 1.1)) * hill * 0.22 * floorKeep;
+  return softenLow(h * hill + wander);
+}
+
+// 1 on forested ground the mountain field has flattened, 0 on cliffs and summits.
+// shape is valleyShape (pass 1 where there is no valley). ad is valleyAd.
+fn woodedWeight(m: f32, shape: f32, ad: f32) -> f32 {
+  if (F.falls.x > 0.0 && F.valley.x > 0.0) {
+    let lip = F.valley.y + max(F.falls.y, 40.0);
+    let above = smoothstep(lip + 16.0, lip + 170.0, ad);
+    return above * (1.0 - smoothstep(0.4, 0.82, m));
+  }
+  if (F.valley.x > 0.0) {
+    // Full across the floor and the wooded lower slopes. The high walls keep the mountain field.
+    let onFloor = 1.0 - smoothstep(0.04, 0.62, shape);
+    let summit = smoothstep(0.58, 0.92, m) * smoothstep(0.28, 0.7, shape);
+    return onFloor * (1.0 - summit);
+  }
+  // No carved valley (the shield). Trees cover the lows and most of the tops.
+  return 1.0 - smoothstep(0.42, 0.86, m) * 0.5;
+}
+
 // Terrain height in metres.
 fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
   let z = xz.y;
@@ -2102,8 +2181,10 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
     h = mix(h, min(h, bankH), 1.0 - smoothstep(2.2, 5.5, x));
     h = mix(min(h, bed), h, smoothstep(0.8, 1.12, x));
   }
+  var pool = 0.0;
   if (F.falls.x > 0.0) {
     let feed = rimFeed(xz);
+    pool = feed.cover;
     if (feed.cover > 0.0) {
       // Level the pool to the rim at its centre, so it reads as a lake rather than a wet slope.
       let adHere = valleyAd(xz);
@@ -2126,6 +2207,15 @@ fn terrainHeight(xz: vec2f, texel: f32) -> f32 {
       h += ledge * onWall * (1.0 - smoothstep(48.0, 96.0, texel));
     }
   }
+  var ww = woodedWeight(m, shape, ad);
+  // The channel and a narrow floodplain stay put. The woods beyond them roll.
+  if (F.valley.z > 0.0 && F.falls.x < 0.5) {
+    let bank = abs(riverOffset(xz)) / max(riverHalfWidth(z), 1.0);
+    ww *= smoothstep(1.05, 4.6, bank);
+  }
+  // Tarn beds stay level. The hills begin again on the ground around them.
+  ww *= 1.0 - smoothstep(0.12, 0.7, pool);
+  if (ww > 0.02) { h += woodedRelief(xz, texel) * ww; }
   return h;
 }
 
