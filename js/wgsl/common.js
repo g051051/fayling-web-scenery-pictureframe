@@ -13,10 +13,13 @@ export const TREE_RANGE = 6000;
 export const TREE_NEAR_DIST = 1800;
 export const TREE_MAX = 900000;
 export const TREE_NEAR_MAX = 160000;
-// Broadleaf trees inside TREE_CLUMP_DIST are built from separate leaf clumps. They sit in
-// their own list between the near list and the far list.
-export const TREE_CLUMP_DIST = 700;
-export const TREE_CLUMP_MAX = 60000;
+// Every broadleaf crown is the same arrangement of leaf clumps at every distance, so a
+// tree never changes shape as the camera approaches. Past TREE_CLUMP_DETAIL the clumps
+// keep that arrangement and drop to eight triangles each, which is invisible once a
+// clump is only a few pixels wide.
+export const TREE_CLUMP_DETAIL = 1200;
+export const TREE_CLUMP_DETAIL_MAX = 40000;
+export const TREE_CLUMP_COARSE_MAX = 160000;
 
 // Per-frame uniform block shared by every render / sky / terrain shader.
 // Layout must match the Float32Array offsets in main.js (writeFrame).

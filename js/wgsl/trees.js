@@ -5,10 +5,11 @@
 // recoloured towards the stand colour the ground already carries.
 //
 // Near crowns are not cones. A fir is a pointed skirt with a shallow branch notch and a
-// ragged outline; a broadleaf is a lobed dome, and in the open it sits on a stem. Juniper
-// is a low cushion. The far list stays a cone, with the same stem, and fades to the stand.
+// ragged outline. A broadleaf is the same cluster of leaf clumps at every distance, so the
+// crown never changes shape as the camera approaches. Juniper is a low cushion. The far
+// list (firs past the near distance) stays a cone and fades to the stand.
 import { FRAME_WGSL, ATMO_CORE_WGSL, NOISE_WGSL, AP_RES, AP_MAX_KM,
-  TREE_RANGE, TREE_NEAR_DIST, TREE_MAX, TREE_NEAR_MAX, TREE_CLUMP_DIST, TREE_CLUMP_MAX } from './common.js';
+  TREE_RANGE, TREE_NEAR_DIST, TREE_MAX, TREE_NEAR_MAX, TREE_CLUMP_DETAIL, TREE_CLUMP_DETAIL_MAX, TREE_CLUMP_COARSE_MAX } from './common.js';
 import { SKY_RENDER_FUNCS } from './sky.js';
 import { TERRAIN_FUNCS, clipSampleWGSL } from './terrain.js';
 import { FOREST_FUNCS } from './forest.js';
@@ -31,6 +32,9 @@ export const TREE_LUMP_SEGS = 8;
 const TREE_LUMP_TRIS = TREE_LUMP_SEGS * 4;
 const TREE_CLUMP_CROWN_TRIS = TREE_CLUMPS * TREE_LUMP_TRIS;
 export const TREE_VERTS_CLUMP = (TREE_CLUMP_CROWN_TRIS + TREE_TRUNK_TRIS_NEAR) * 3;
+// the same twelve clumps, each an octahedron, for crowns where a clump is only a few pixels
+export const TREE_COARSE_LUMP_TRIS = 8;
+export const TREE_VERTS_COARSE = (TREE_CLUMPS * TREE_COARSE_LUMP_TRIS + TREE_TRUNK_TRIS_NEAR) * 3;
 // far: a cone fan plus a camera-facing stem quad
 export const TREE_VERTS_FAR = (TREE_SEGS_FAR + 2) * 3;
 
@@ -44,13 +48,16 @@ const TREE_SEGS_NEAR: u32 = ${TREE_SEGS_NEAR}u;
 const TREE_RINGS_NEAR: u32 = ${TREE_RINGS_NEAR}u;
 const TREE_TRUNK_SIDES: u32 = ${TREE_TRUNK_SIDES}u;
 const TREE_SEGS_FAR: u32 = ${TREE_SEGS_FAR}u;
-const TREE_CLUMP_DIST: f32 = ${TREE_CLUMP_DIST}.0;
-const TREE_CLUMP_MAX: u32 = ${TREE_CLUMP_MAX}u;
-const TREE_FAR_MAX: u32 = ${TREE_MAX - TREE_NEAR_MAX - TREE_CLUMP_MAX}u;
+const TREE_CLUMP_DETAIL: f32 = ${TREE_CLUMP_DETAIL}.0;
+const TREE_DETAIL_MAX: u32 = ${TREE_CLUMP_DETAIL_MAX}u;
+const TREE_COARSE_MAX: u32 = ${TREE_CLUMP_COARSE_MAX}u;
+const TREE_FAR_MAX: u32 = ${TREE_MAX - TREE_NEAR_MAX - TREE_CLUMP_DETAIL_MAX - TREE_CLUMP_COARSE_MAX}u;
 const TREE_CLUMPS: u32 = ${TREE_CLUMPS}u;
 const LUMP_SEGS: u32 = ${TREE_LUMP_SEGS}u;
 const LUMP_TRIS: u32 = ${TREE_LUMP_TRIS}u;
 const CLUMP_CROWN_TRIS: u32 = ${TREE_CLUMP_CROWN_TRIS}u;
+const COARSE_LUMP_TRIS: u32 = ${TREE_COARSE_LUMP_TRIS}u;
+const COARSE_CROWN_TRIS: u32 = ${TREE_CLUMPS * TREE_COARSE_LUMP_TRIS}u;
 const NEAR_CROWN_TRIS: u32 = ${TREE_CROWN_TRIS_NEAR}u;
 const NEAR_TRUNK_TRIS: u32 = ${TREE_TRUNK_TRIS_NEAR}u;
 struct TreeInst {
@@ -145,7 +152,7 @@ struct ShadowMap { origin: vec2f, texel: f32, span: f32 };
 struct GenU { cell0: vec2i, dim: u32, pad: u32 };
 @group(0) @binding(7) var<uniform> G: GenU;
 @group(0) @binding(8) var<storage, read_write> trees: array<TreeInst>;
-@group(0) @binding(9) var<storage, read_write> args: array<atomic<u32>, 12>;
+@group(0) @binding(9) var<storage, read_write> args: array<atomic<u32>, 16>;
 ` + NOISE_WGSL + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + TREE_CONSTS + /* wgsl */ `
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
@@ -243,15 +250,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   inst.c = vec4f(sunVis, cloudSh * sunUp, m.x, m.y);
   inst.d = vec4f(stand, 0.0);
   inst.e = vec4f(alb, 0.0);
-  if (dist < TREE_NEAR_DIST) {
-    // Close broadleaf trees are built from leaf clumps. Firs and juniper keep the shell.
-    if (dist < TREE_CLUMP_DIST && !t.conifer && F.mist.z < 0.5) {
+  // One arrangement of leaf clumps for a hardwood at every distance. Close ones are
+  // smooth ellipsoids; farther ones are the same clumps with eight triangles each.
+  // Firs and juniper keep the near shell and the far cone.
+  if (!t.conifer && F.mist.z < 0.5) {
+    if (dist < TREE_CLUMP_DETAIL) {
       let c = atomicAdd(&args[9], 1u);
-      if (c < TREE_CLUMP_MAX) { trees[TREE_NEAR_MAX + c] = inst; }
+      if (c < TREE_DETAIL_MAX) { trees[TREE_NEAR_MAX + c] = inst; }
     } else {
-      let i = atomicAdd(&args[1], 1u);
-      if (i < TREE_NEAR_MAX) { trees[i] = inst; }
+      let c = atomicAdd(&args[13], 1u);
+      if (c < TREE_COARSE_MAX) { trees[TREE_NEAR_MAX + TREE_DETAIL_MAX + c] = inst; }
     }
+  } else if (dist < TREE_NEAR_DIST) {
+    let i = atomicAdd(&args[1], 1u);
+    if (i < TREE_NEAR_MAX) { trees[i] = inst; }
   } else {
     let j = atomicAdd(&args[5], 1u);
     if (j < TREE_FAR_MAX) { trees[TREE_MAX - 1u - j] = inst; }
@@ -276,6 +288,7 @@ const AP_N: f32 = ${AP_RES}.0;
 const AP_MAX: f32 = ${AP_MAX_KM}.0;
 override FAR: bool = false;
 override LUMP: bool = false;
+override COARSE: bool = false;
 
 struct VOut {
   @builtin(position) pos: vec4f,
@@ -397,8 +410,11 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
   o.ti = 0u;
   o.lump = vec2f(0.5, 1.0);
   var ti = ii;
-  if (LUMP) {
-    if (ii >= TREE_CLUMP_MAX) { return o; }
+  if (LUMP && COARSE) {
+    if (ii >= TREE_COARSE_MAX) { return o; }
+    ti = TREE_NEAR_MAX + TREE_DETAIL_MAX + ii;
+  } else if (LUMP) {
+    if (ii >= TREE_DETAIL_MAX) { return o; }
     ti = TREE_NEAR_MAX + ii;
   } else if (FAR) {
     if (ii >= TREE_FAR_MAX) { return o; }
@@ -432,7 +448,42 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
   var crownU = 1.0;
   var live = false;
 
-  if (LUMP && tri < CLUMP_CROWN_TRIS) {
+  if (COARSE && tri < COARSE_CROWN_TRIS) {
+    live = true;
+    let li = tri / COARSE_LUMP_TRIS;
+    let lt = tri % COARSE_LUMP_TRIS;
+    let side = lt / 2u;
+    let lower = (lt & 1u) == 1u;
+    let lp = lumpOf(li, r, base, top, seed, max(open * 0.6, trop));
+    var th = 0.0;
+    var ph = 0.0;
+    if (!lower) {
+      if (k == 0u) { th = 0.0; }
+      else { th = 1.5707963; ph = 6.2831853 * f32(side + k - 1u) / 4.0; }
+    } else if (k == 0u) {
+      th = 3.14159265;
+    } else {
+      th = 1.5707963;
+      ph = 6.2831853 * f32(side + select(1u, 0u, k == 2u)) / 4.0;
+    }
+    ph += lp.rot;
+    let u = vec3f(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+    let wob = 1.0 + 0.10 * sin(ph * 2.0 + lp.rot * 3.0);
+    let radii = vec3f(lp.rh * wob, lp.rv, lp.rh * wob);
+    let off = lp.c + u * radii;
+    yAbs = off.y;
+    let horiz = vec2f(off.x, off.z) + lean * (yAbs / max(top, 0.5));
+    world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
+    dv = horiz;
+    let nEll = normalize(u / radii);
+    let dc = off - vec3f(0.0, base + 0.5 * spanH, 0.0);
+    let dcl = length(dc);
+    var nsum = nEll;
+    if (dcl > 1e-3) { nsum = nEll * 0.6 + dc / dcl * 0.4; }
+    if (length(nsum) < 1e-3) { nrm = nEll; } else { nrm = normalize(nsum); }
+    crownU = clamp((yAbs - base) / spanH, 0.0, 1.0);
+    o.lump = vec2f(lp.rnd, mix(0.8, 1.0, smoothstep(-0.7, 0.5, u.y)));
+  } else if (LUMP && tri < CLUMP_CROWN_TRIS) {
     live = true;
     let li = tri / LUMP_TRIS;
     let lt = tri % LUMP_TRIS;
@@ -563,7 +614,7 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
     crownU = shape.y;
   } else if (base > 1.15 && !juniper) {
     live = true;
-    let ttri = tri - select(NEAR_CROWN_TRIS, CLUMP_CROWN_TRIS, LUMP);
+    let ttri = tri - select(select(NEAR_CROWN_TRIS, CLUMP_CROWN_TRIS, LUMP), COARSE_CROWN_TRIS, COARSE);
     let side = ttri / 2u;
     let second = (ttri & 1u) == 1u;
     var corner = k;
