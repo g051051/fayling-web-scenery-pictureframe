@@ -7,7 +7,7 @@ import { SKY_W, SKY_H, AP_RES, CLIP_RES, CLIP_LEVELS, CLIP_TEXEL0, PROBE_N } fro
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, AP_LUT, cloudShadowBakeWGSL, skyReflectBakeWGSL, SHADOW_N, SHADOW_SPAN, REFL_W, REFL_H } from './wgsl/sky.js';
 import { CLIP_HEIGHT, CLIP_DERIVE, HEIGHT_PROBE } from './wgsl/terrain.js';
 import { SKY_BG, landWGSL } from './wgsl/land.js';
-import { treeLightWGSL, treeGenWGSL, treeDrawWGSL, TREE_INST_BYTES, TREE_GEN_GROUP, TREE_VERTS_NEAR, TREE_VERTS_FAR } from './wgsl/trees.js';
+import { treeLightWGSL, treeGenWGSL, treeDrawWGSL, TREE_INST_BYTES, TREE_GEN_GROUP, TREE_VERTS_NEAR, TREE_VERTS_FAR, TREE_VERTS_CLUMP } from './wgsl/trees.js';
 import { TREE_RANGE, TREE_MAX } from './wgsl/common.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { RAIN_DROP_INIT, RAIN_DROP_UPDATE, RAIN_DRAW, RAIN_MIST, MAX_DROPS } from './wgsl/rain.js';
@@ -380,15 +380,15 @@ async function main() {
     depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
-  const treePipe = (far) => device.createRenderPipelineAsync({
-    label: far ? 'trees far' : 'trees near', layout: 'auto',
-    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0 } },
+  const treePipe = (far, clump) => device.createRenderPipelineAsync({
+    label: far ? 'trees far' : clump ? 'trees clumps' : 'trees near', layout: 'auto',
+    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0, LUMP: clump ? 1 : 0 } },
     fragment: { module: treeMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
-  const [treeNearPipe, treeFarPipe] = await Promise.all([treePipe(false), treePipe(true)]);
+  const [treeNearPipe, treeFarPipe, treeClumpPipe] = await Promise.all([treePipe(false, false), treePipe(true, false), treePipe(false, true)]);
   await paintLoad('Preparing the sky', 0.82);
   const skyPipe = await device.createRenderPipelineAsync({
     label: 'sky', layout: 'auto',
@@ -471,15 +471,15 @@ async function main() {
     shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
   // Instanced trees: a list written by a compute pass and drawn with two indirect draws.
   const treeBuf = mkBuf(TREE_MAX * TREE_INST_BYTES, GU.STORAGE, 'trees');
-  const treeArgs = mkBuf(32, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
-  const treeArgsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'tree args read');
+  const treeArgs = mkBuf(48, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
+  const treeArgsRead = mkBuf(48, GU.MAP_READ | GU.COPY_DST, 'tree args read');
   const treeLight = mkBuf(128, GU.STORAGE, 'tree light');
   const treeGenUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'tree gen');
   const treeGenData = new ArrayBuffer(16);
   const treeGenI = new Int32Array(treeGenData), treeGenU = new Uint32Array(treeGenData);
-  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0]);
+  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0, TREE_VERTS_CLUMP, 0, 0, 0]);
   let treeArgsPending = false;
-  window.__trees = [0, 0];
+  window.__trees = [0, 0, 0];
   const bgTreeLight = bg(treeLightPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: rainUBO }, { buffer: treeLight }], 'tree light');
   const bgTreeGen = bg(treeGenPipe, [{ buffer: frameUBO }, sampClamp, arr(clipA), arr(clipB), { buffer: clipUBO },
     shadowView, { buffer: shadowUBO }, { buffer: treeGenUBO }, { buffer: treeBuf }, { buffer: treeArgs }, { buffer: treeLight }], 'tree gen');
@@ -488,6 +488,7 @@ async function main() {
     { binding: 10, resource: { buffer: treeLight } }];
   const bgTreeNear = device.createBindGroup({ label: 'trees near', layout: treeNearPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgTreeFar = device.createBindGroup({ label: 'trees far', layout: treeFarPipe.getBindGroupLayout(0), entries: treeEntries });
+  const bgTreeClump = device.createBindGroup({ label: 'trees clumps', layout: treeClumpPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -3495,6 +3496,9 @@ async function main() {
     rp.setPipeline(treeNearPipe);
     rp.setBindGroup(0, bgTreeNear);
     rp.drawIndirect(treeArgs, 0);
+    rp.setPipeline(treeClumpPipe);
+    rp.setBindGroup(0, bgTreeClump);
+    rp.drawIndirect(treeArgs, 32);
     rp.setPipeline(treeFarPipe);
     rp.setBindGroup(0, bgTreeFar);
     rp.drawIndirect(treeArgs, 16);
@@ -3541,7 +3545,7 @@ async function main() {
     if (doProbe) enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, PROBE_N * 4);
     let doTreeRead = false;
     if (!treeArgsPending && (frameIndex & 63) === 0) {
-      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 32);
+      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 48);
       doTreeRead = true;
     }
     let doTs = false;
@@ -3564,7 +3568,7 @@ async function main() {
       treeArgsPending = true;
       treeArgsRead.mapAsync(GPUMapMode.READ).then(() => {
         const a = new Uint32Array(treeArgsRead.getMappedRange());
-        window.__trees = [a[1], a[5]];
+        window.__trees = [a[1], a[5], a[9]];
         treeArgsRead.unmap();
         treeArgsPending = false;
       }, () => { treeArgsPending = false; });

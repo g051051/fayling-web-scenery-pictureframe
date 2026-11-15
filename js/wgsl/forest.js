@@ -49,17 +49,14 @@ fn treeCell(cell: vec2i, sampleMasks: bool, dens0: f32, conif0: f32) -> Tree {
   t.tint = unit16(h3);
   t.hue = unit16(h3 >> 16u);
   t.seed = f32(h0 & 1023u);
-  // Closed broadleaf stands still meet at the understory, so the canopy stays shut.
-  // Open crowns sit up on a stem. Conifers keep a short skirt and show a trunk in the gaps.
+  // Every hardwood stands on a visible stem with its crown above it. Dropping the crown
+  // to the understory made each one read as a bush or a pod on the ground.
   // Some firs hold a skirt to the ground, some stand on a clear bole.
-  // Broadleaf in a closed stand still come down to the understory so the crowns meet.
-  // Only an open stand lifts the crown onto a stem.
   let coniferStem = t.top * mix(0.05, 0.36, pow(t.tint, 1.4));
-  let broadStem = t.top * mix(0.40, 0.55, t.hue);
-  let meet = min(understoryH(m.x), t.top * 0.72);
-  // Most of a stand stays closed. Only a real gap lifts a hardwood onto a stem.
-  let closed = smoothstep(0.12, 0.42, m.x);
-  t.base = select(mix(broadStem, meet, closed), coniferStem, t.conifer);
+  // A rainforest crown is a shallow umbrella high on a tall straight trunk. A deep crown
+  // that is widest at the top tapers into an inverted cone.
+  let broadStem = t.top * mix(mix(0.22, 0.32, t.hue), mix(0.46, 0.56, t.hue), trop);
+  t.base = select(broadStem, coniferStem, t.conifer);
   if (F.mist.z > 0.5) {
     // juniper: a low rounded shrub, not a spruce on a pole
     t.conifer = false;
