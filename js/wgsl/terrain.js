@@ -781,9 +781,12 @@ fn seaState(xz: vec2f, t: f32, minL: f32, depth: f32, foam: bool) -> Sea {
 }
 `;
 
-// One clipmap level, height only. B.xy is the world position of texel (0, 0).
+// One clipmap level, height only. B.xy is the world position of texel (0, 0). A moved
+// level keeps the texels it still covers and bakes only the strips it has just uncovered:
+// hRect / dRect are the texel rectangles (x, y, width, height) the height and derive
+// passes fill.
 const BAKE_UNIFORM = /* wgsl */ `
-struct Bake { origin: vec2f, texel: f32, level: f32 };
+struct Bake { origin: vec2f, texel: f32, level: f32, hRect: vec4f, dRect: vec4f };
 @group(0) @binding(1) var<uniform> B: Bake;
 `;
 
@@ -794,13 +797,14 @@ export const CLIP_HEIGHT = FRAME_WGSL + /* wgsl */ `
 ` + NOISE_WGSL + TERRAIN_FUNCS + PLANET_HEIGHT_WGSL + /* wgsl */ `
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  if (id.x >= ${CLIP_RES}u || id.y >= ${CLIP_RES}u) { return; }
-  let xz = B.origin + vec2f(id.xy) * B.texel;
+  if (id.x >= u32(B.hRect.z) || id.y >= u32(B.hRect.w)) { return; }
+  let c = vec2u(B.hRect.xy) + id.xy;
+  let xz = B.origin + vec2f(c) * B.texel;
   if (F.body.x > 0.5) {
-    textureStore(dst, id.xy, u32(B.level), vec4f(planetHeight(xz), 0.0, 0.0, 0.0));
+    textureStore(dst, c, u32(B.level), vec4f(planetHeight(xz), 0.0, 0.0, 0.0));
     return;
   }
-  textureStore(dst, id.xy, u32(B.level), vec4f(terrainHeight(xz, B.texel), 0.0, 0.0, 0.0));
+  textureStore(dst, c, u32(B.level), vec4f(terrainHeight(xz, B.texel), 0.0, 0.0, 0.0));
 }
 `;
 
@@ -820,8 +824,8 @@ fn hAt(c: vec2i) -> f32 {
 }
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  if (id.x >= ${CLIP_RES}u || id.y >= ${CLIP_RES}u) { return; }
-  let c = vec2i(id.xy);
+  if (id.x >= u32(B.dRect.z) || id.y >= u32(B.dRect.w)) { return; }
+  let c = vec2i(B.dRect.xy) + vec2i(id.xy);
   let h = hAt(c);
   let hl = hAt(c - vec2i(1, 0));
   let hr = hAt(c + vec2i(1, 0));
@@ -837,12 +841,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let lap = (hAt(c - vec2i(k, 0)) + hAt(c + vec2i(k, 0)) + hAt(c - vec2i(0, k)) + hAt(c + vec2i(0, k)) - 4.0 * h)
           / (f32(k * k) * tx * tx);
 
-  let xz = B.origin + vec2f(id.xy) * tx;
+  let xz = B.origin + vec2f(c) * tx;
   if (F.body.x > 0.5) {
     // These derivatives come from the spline-reconstructed height bake, so the
     // lighting normals follow the smoothed geometry rather than raw DEM cells.
-    textureStore(dstA, id.xy, u32(B.level), vec4f(h, grad, lap));
-    textureStore(dstB, id.xy, u32(B.level), vec4f(0.0, 0.0, 1.0, 0.0));
+    textureStore(dstA, c, u32(B.level), vec4f(h, grad, lap));
+    textureStore(dstB, c, u32(B.level), vec4f(0.0, 0.0, 1.0, 0.0));
     return;
   }
   let wl = waterLevel(xz.y);
@@ -916,8 +920,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     snow *= 1.0 - smoothstep(0.2, 0.8, feed.cover);
   }
 
-  textureStore(dstA, id.xy, u32(B.level), vec4f(h, grad, lap));
-  textureStore(dstB, id.xy, u32(B.level), vec4f(clamp(dens, 0.0, 1.0), conif, clamp(rock, 0.0, 1.0), clamp(snow, 0.0, 1.0)));
+  textureStore(dstA, c, u32(B.level), vec4f(h, grad, lap));
+  textureStore(dstB, c, u32(B.level), vec4f(clamp(dens, 0.0, 1.0), conif, clamp(rock, 0.0, 1.0), clamp(snow, 0.0, 1.0)));
 }
 `;
 

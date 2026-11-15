@@ -1,8 +1,9 @@
 // Individual trees. Every cell of a jittered grid (spacing F.forest.y) may hold one tree;
 // whether it does, its species and its size come from the land-cover masks at the trunk and
 // a per-cell hash, so the vertex and fragment stages always agree on the same tree.
-// Conifers are cones, broadleaf crowns are domes (flatter umbrellas in the tropics). The
-// canopy surface is the highest crown over a point; its gradient is analytic.
+// Conifers are narrow firs, broadleaf crowns are domes (flatter umbrellas in the tropics,
+// low cushions for juniper). The crown mesh lives in trees.js. crownAt is the outer
+// envelope of that mesh, kept for anything that still queries the canopy as a surface.
 // Requires TERRAIN_FUNCS and the clipmap lookups (clipSampleWGSL).
 export const FOREST_FUNCS = /* wgsl */ `
 struct Tree {
@@ -44,19 +45,28 @@ fn treeCell(cell: vec2i, sampleMasks: bool, dens0: f32, conif0: f32) -> Tree {
   // broadleaf crowns about as wide as the spacing, so neighbours close into one canopy;
   // the 3x3 cell search holds radii up to 1.1 spacings
   t.r = sp * select(min(mix(0.95, 1.0, trop) * pow(sz, 0.6), 1.08), 0.52 * pow(sz, 0.65), t.conifer);
-  // broadleaf domes taper down to the understory, so a closed stand has no crown walls
-  t.base = select(min(understoryH(m.x), t.top * 0.7), t.top * 0.2, t.conifer);
   let h3 = pcgHash(h2 ^ 0x1b873593u);
   t.tint = unit16(h3);
   t.hue = unit16(h3 >> 16u);
   t.seed = f32(h0 & 1023u);
+  // Closed broadleaf stands still meet at the understory, so the canopy stays shut.
+  // Open crowns sit up on a stem. Conifers keep a short skirt and show a trunk in the gaps.
+  // Some firs hold a skirt to the ground, some stand on a clear bole.
+  // Broadleaf in a closed stand still come down to the understory so the crowns meet.
+  // Only an open stand lifts the crown onto a stem.
+  let coniferStem = t.top * mix(0.05, 0.36, pow(t.tint, 1.4));
+  let broadStem = t.top * mix(0.40, 0.55, t.hue);
+  let meet = min(understoryH(m.x), t.top * 0.72);
+  // Most of a stand stays closed. Only a real gap lifts a hardwood onto a stem.
+  let closed = smoothstep(0.12, 0.42, m.x);
+  t.base = select(mix(broadStem, meet, closed), coniferStem, t.conifer);
   if (F.mist.z > 0.5) {
-    // juniper: a low rounded shrub, not a spruce cone
+    // juniper: a low rounded shrub, not a spruce on a pole
     t.conifer = false;
     let szj = sz * 0.72;
     t.top = F.forest.z * szj;
     t.r = min(sp * 0.46 * sqrt(szj), sp * 0.55);
-    t.base = t.top * 0.22;
+    t.base = t.top * 0.10;
   }
   return t;
 }
@@ -134,9 +144,9 @@ fn coniferAlbedo(t: Tree) -> vec3f {
   return base * (0.75 + 0.5 * t.tint);
 }
 fn summerAlbedo(t: Tree) -> vec3f {
-  let yellow = vec3f(0.062, 0.088, 0.026);
-  let blue = vec3f(0.036, 0.068, 0.032);
-  return mix(blue, yellow, t.hue) * (0.78 + 0.45 * t.tint);
+  let yellow = vec3f(0.046, 0.074, 0.026);
+  let blue = vec3f(0.028, 0.055, 0.028);
+  return mix(blue, yellow, t.hue) * (0.82 + 0.36 * t.tint);
 }
 fn autumnAlbedo(t: Tree) -> vec3f {
   let k = fract(t.hue * 7.31 + t.tint * 0.37);
