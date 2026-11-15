@@ -12,6 +12,7 @@ import { TREE_RANGE, TREE_MAX } from './wgsl/common.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 import { RAIN_DROP_INIT, RAIN_DROP_UPDATE, RAIN_DRAW, RAIN_MIST, MAX_DROPS } from './wgsl/rain.js';
 import { SCENES, sceneUniforms } from './scenes.js';
+import { decodeMoonTerrain } from './planet-terrain.js';
 import { celestialState } from './astronomy.js';
 import { createStarMapData, STAR_MAP_WIDTH, STAR_MAP_HEIGHT } from './star-catalog.js';
 import { createWeatherWidget, rainPresetForObservation } from './weather.js';
@@ -266,7 +267,10 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge', addressModeW: 'clamp-to-edge',
   });
-  const frameUBO = mkBuf(576, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const frameUBO = mkBuf(608, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const moonHeights = await decodeMoonTerrain();
+  const planetDEM = mkBuf(moonHeights.byteLength, GU.STORAGE | GU.COPY_DST, 'Moon elevation');
+  device.queue.writeBuffer(planetDEM, 0, moonHeights);
   const transView = transLUT.createView();
   const msView = msLUT.createView();
   const skyView = skyLUT.createView();
@@ -317,7 +321,7 @@ async function main() {
   for (let i = 0; i < CLIP_LEVELS * 2; i++) {
     const ubo = mkBuf(48, GU.UNIFORM | GU.COPY_DST, 'bake ' + i);
     bakeUBOs.push(ubo);
-    bgClipHeight.push(bg(clipHeightPipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH)], 'clip height ' + i));
+    bgClipHeight.push(bg(clipHeightPipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH), { buffer: planetDEM }], 'clip height ' + i));
     bgClipDerive.push(bg(clipDerivePipe, [{ buffer: frameUBO }, { buffer: ubo }, arr(clipH), arr(clipA), arr(clipB)], 'clip derive ' + i));
   }
   const bakeF = new Float32Array(12);
@@ -330,7 +334,7 @@ async function main() {
   const probeUBO = mkBuf(PROBE_N * 16, GU.UNIFORM | GU.COPY_DST, 'probe points');
   const probeOut = mkBuf(PROBE_N * 4, GU.STORAGE | GU.COPY_SRC, 'probe out');
   const probeRead = mkBuf(PROBE_N * 4, GU.MAP_READ | GU.COPY_DST, 'probe read');
-  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, { buffer: probeUBO }, { buffer: probeOut }], 'probe');
+  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, { buffer: probeUBO }, { buffer: probeOut }, { buffer: planetDEM }], 'probe');
   const probeQ = new Float32Array(PROBE_N * 4);
   const probeSentXZ = new Float32Array(PROBE_N * 2);
   const probeXZ = new Float32Array(PROBE_N * 2);
@@ -702,7 +706,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Uniform data
   // --------------------------------------------------------------------------------------
-  const frameF = new Float32Array(144);
+  const frameF = new Float32Array(152);
   const frameI = new Int32Array(frameF.buffer);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
@@ -754,19 +758,24 @@ async function main() {
     tour.fade = 0;
     writeSceneUniforms();
     invalidateClips();
-    flight.z = Number(qs.get('z')) || 0;
+    const requestedZ = Number(qs.get('z'));
+    const useRequestedZ = qs.has('z') && Number.isFinite(requestedZ) && (!tour.scene.body || tour.visit === 0);
+    flight.z = useRequestedZ ? requestedZ : (tour.scene.flight.startZ ?? 0);
+    if (tour.scene.body) flight.z = Math.max(tour.scene.flight.endZ, Math.min(tour.scene.flight.startZ, flight.z));
     flight.off = 0;
     flight.yaw = flightTargetYaw();
     flight.bank = 0;
     flight.yawRate = 0;
     flight.vy = 0;
-    flight.y = path.waterLevel(flight.z) + tour.scene.relief * 0.8 + tour.scene.flight.agl;
+    flight.y = (tour.scene.body?.max ?? (path.waterLevel(flight.z) + tour.scene.relief * 0.8)) + tour.scene.flight.agl;
     cam.x = flightLineX(flight.z);
     cam.z = flight.z;
     cam.y = flight.y;
     groundRef = path.waterLevel(flight.z);
     applySceneSky();
     updateHudScene();
+    document.getElementById('weather-widget').style.visibility = tour.scene.body ? 'hidden' : '';
+    updateSkyReadout();
   }
   function requestScene(index) {
     tour.next = index;
@@ -800,7 +809,7 @@ async function main() {
       if (tour.fade >= 1) tour.state = 'run';
     } else if (tour.state === 'run') {
       if (P.autopilot) tour.t += dt;
-      if (tour.t > P.tourMinutes * 60) requestScene(nextTourIndex());
+      if (!tour.scene.flight.route && tour.t > P.tourMinutes * 60) requestScene(nextTourIndex());
     } else if (tour.state === 'out') {
       tour.fade = Math.max(0, tour.fade - dt / 1.8);
       if (tour.labelT > 0) hideSceneLabel();
@@ -829,6 +838,7 @@ async function main() {
 
   function flightLineX(z) {
     const s = tour.scene;
+    if (s.flight.route) return s.flight.route.x(z);
     const phase = z * (Math.PI * 2 / 7300) + path.seed * 0.37;
     if (s.coast) {
       // Stay just offshore of the waterline so the frame splits: open ocean to one
@@ -860,7 +870,11 @@ async function main() {
     return Math.atan2(xa - x, ahead);
   }
   function flightAgl() {
+    if (tour.scene.flight.route) return tour.scene.flight.route.agl(flight.z) * P.flightAltitude;
     return tour.scene.flight.agl * P.flightAltitude * (1 + 0.16 * Math.sin(flight.z * (Math.PI * 2 / 9000) + 1.3));
+  }
+  function flightPitch() {
+    return tour.scene.flight.route?.pitch(flight.z) ?? tour.scene.flight.pitch;
   }
   // Highest height the camera must hold now so that it clears every probed point ahead with
   // its target clearance by the time it gets there, climbing no steeper than about 1 in 8.
@@ -873,7 +887,9 @@ async function main() {
       const along = dx * fx + dz * fz;
       const r = Math.hypot(dx, dz);
       if (r < best) { best = r; under = probeH[i]; }
-      need = Math.max(need, probeH[i] + agl - Math.max(0, along - 250) * 0.12);
+      const plannedAgl = P.autopilot && tour.scene.flight.route && agl > 0
+        ? Math.max(agl, tour.scene.flight.route.agl(probeXZ[i * 2 + 1]) * P.flightAltitude) : agl;
+      need = Math.max(need, probeH[i] + plannedAgl - Math.max(0, along - 250) * 0.12);
     }
     groundUnder = under;
     return Math.max(need, under + agl * 0.55);
@@ -891,9 +907,10 @@ async function main() {
     for (let i = 0; i < PROBE_N; i++) {
       let x, z;
       if (i < 24) {
-        const d = (i - 1) * 130;
+        const d = (i - 1) * (tour.scene.flight.route ? 600 : 130);
         if (P.autopilot && tour.state !== 'out') {
-          z = flight.z - d;
+          const slope = tour.scene.flight.route?.slope(flight.z) ?? 0;
+          z = flight.z - d / Math.sqrt(1 + slope * slope);
           x = flightLineX(z) + flight.off * Math.exp(-d / 1500);
         } else {
           x = cam.x + fx * d; z = cam.z + fz * d;
@@ -948,7 +965,7 @@ async function main() {
   function resetView() {
     flight.lookYaw = flight.lookPitch = 0;
     if (!P.autopilot) {
-      cam.pitch = (tour.scene.flight.pitch + P.cameraTilt) * D2R;
+      cam.pitch = (flightPitch() + P.cameraTilt) * D2R;
       cam.roll = 0;
     }
   }
@@ -999,9 +1016,13 @@ async function main() {
 
   function updateAutopilot(dt) {
     const s = tour.scene;
-    const v = s.flight.speed * P.flightSpeed;
-    const slope = path.valleyDX(flight.z);
+    const route = s.flight.route;
+    // In tours the complete lunar route fits the selected duration at Speed=1.
+    // Single-scene mode keeps the scenic cruising speed and runs to the endpoint.
+    const v = (route && P.sceneMode === 'tour' ? route.length / (P.tourMinutes * 60) : s.flight.speed) * P.flightSpeed;
+    const slope = route ? route.slope(flight.z) : path.valleyDX(flight.z);
     flight.z -= v * dt / Math.sqrt(1 + slope * slope);
+    if (s.body && flight.z < s.flight.endZ && tour.state !== 'out') requestScene(nextTourIndex());
     flight.off *= Math.exp(-dt / 8);
     const target = flightTargetYaw();
     const prevYaw = flight.yaw;
@@ -1034,7 +1055,7 @@ async function main() {
     cam.yaw = flight.yaw + flight.lookYaw;
     // gentle nose-down into descents, nose-up into climbs
     const climb = Math.max(-0.08, Math.min(0.08, flight.vy / Math.max(v, 1)));
-    cam.pitch = Math.max(-1.5, Math.min(1.2, (s.flight.pitch + P.cameraTilt) * D2R + climb * 0.5 + flight.lookPitch));
+    cam.pitch = Math.max(-1.5, Math.min(1.2, (flightPitch() + P.cameraTilt) * D2R + climb * 0.5 + flight.lookPitch));
     cam.roll = flight.bank;
   }
   function updateFreeFlight(dt) {
@@ -1048,6 +1069,12 @@ async function main() {
     const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
     const v = 60 * P.flightSpeed * boost * dt;
     cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
+    if (tour.scene.body) {
+      // Keep free flight inside the measured crop, with a margin for clearance probes.
+      const b = tour.scene.body;
+      cam.x = Math.max(-b.halfWidth + 10000, Math.min(b.halfWidth - 10000, cam.x));
+      cam.z = Math.max(-b.halfHeight + 10000, Math.min(b.halfHeight - 10000, cam.z));
+    }
     cam.roll *= Math.exp(-dt * 2);
     if (probeGen === tour.gen) {
       requiredAltitude(0);
@@ -1061,7 +1088,7 @@ async function main() {
     flight.vy = 0;
     flight.yaw = cam.yaw;
     flight.lookYaw = 0;
-    flight.lookPitch = cam.pitch - (tour.scene.flight.pitch + P.cameraTilt) * D2R;
+    flight.lookPitch = cam.pitch - (flightPitch() + P.cameraTilt) * D2R;
   }
   function updateCamera(dt) {
     if (P.autopilot) updateAutopilot(dt);
@@ -1208,6 +1235,10 @@ async function main() {
     // the Earth's curvature drops the far terrain by up to ~1 km
     yLo = wl - 30 - s.basin * s.relief - drift - 1000;
     yHi = wl + s.floor + s.relief * 1.6 + s.height * P.treeHeight * 1.6 + 60 + drift;
+    if (s.body) {
+      yLo = s.body.min - MAX_DIST * MAX_DIST / (2 * s.body.radius) - 100;
+      yHi = s.body.max + 100;
+    }
     XB = s.spacing;
     // side planes from the camera-relative view-projection (rows 3±0, 3±1)
     const m = viewProj;
@@ -1503,8 +1534,10 @@ async function main() {
     f[20] = rx * tanX; f[21] = ry * tanX; f[22] = rz * tanX; f[23] = 0;
     f[24] = ux * tanY; f[25] = uy * tanY; f[26] = uz * tanY; f[27] = 0;
     f[28] = fx; f[29] = fy; f[30] = fz; f[31] = 0;
-    const dynamic = skyUsesPlace() && liveSky;
-    const sun = dynamic ? liveSky.sunDirection : horizonDirection(manualSunElev(), P.sunAzim);
+    const airless = tour.scene.body?.airless;
+    const dynamic = !airless && skyUsesPlace() && liveSky;
+    const sun = airless ? horizonDirection(tour.scene.sky.sunElev, tour.scene.sky.sunAzim)
+      : dynamic ? liveSky.sunDirection : horizonDirection(manualSunElev(), P.sunAzim);
     const moon = dynamic ? liveSky.moonDirection : horizonDirection(P.moonElev, P.moonAzim);
     f[32] = sun[0]; f[33] = sun[1]; f[34] = sun[2]; f[35] = 14.0;
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
@@ -2004,7 +2037,7 @@ async function main() {
   const controls = new Map();
   const skyReadout = document.getElementById('sky-readout');
   function updateSkyReadout() {
-    const show = P.showInfo && P.skyMode === 'lapse' && skyInstant;
+    const show = !tour.scene.body?.airless && P.showInfo && P.skyMode === 'lapse' && skyInstant;
     skyReadout.hidden = !show;
     if (!show) return;
     const when = skyInstant.toLocaleString([], {
@@ -2255,6 +2288,7 @@ async function main() {
     let firstGroup = null;
     for (const group of groups || []) {
       const host = group.title ? addDisclosure(parent, group.title, kind) : parent;
+      if (group.title === 'Landscape' || group.title === 'Weather') host.parentElement.dataset.earthOnly = 'true';
       if (group.title && !firstGroup) firstGroup = host;
       for (const setting of group.settings || []) addSetting(host, setting);
       addGroups(host, group.groups, 'subgroup');
@@ -2264,6 +2298,7 @@ async function main() {
   const sectionBodies = [];
   for (const section of SECTIONS) {
     const body = addDisclosure(panelBody, section.title, 'section');
+    if (section.title === 'Sky') body.parentElement.dataset.earthOnly = 'true';
     sectionBodies.push(body);
     addGroups(body, section.groups, 'group');
     if (section.title === 'General') addShortcuts(body);
@@ -2409,11 +2444,15 @@ async function main() {
     if (control.input.required !== undefined) control.input.required = visible;
   }
   function refreshModeGroups() {
+    const airless = Boolean(tour.scene.body?.airless);
+    const skyPreset = controls.get('sceneSky');
+    if (skyPreset) skyPreset.row.hidden = airless;
     const items = [...panelBody.querySelectorAll('.subgroup, .group')].reverse();
     for (const item of items) {
       const body = item.querySelector(':scope > div');
-      item.hidden = ![...body.children].some((child) => !child.hidden);
+      item.hidden = (airless && item.dataset.earthOnly === 'true') || ![...body.children].some((child) => !child.hidden);
     }
+    for (const item of panelBody.querySelectorAll('.section[data-earth-only]')) item.hidden = airless;
   }
   function wrapSigned(deg) {
     return ((deg + 180) % 360 + 360) % 360 - 180;
@@ -2790,6 +2829,7 @@ async function main() {
     closePlaceDialog();
   });
   function rainAmount() {
+    if (tour.scene.body?.airless) return 0;
     return P.rain ? Math.max(0, Math.min(1, P.rainIntensity)) : 0;
   }
   function rainWord(value) {

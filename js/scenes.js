@@ -3,9 +3,14 @@
 // FRAME_WGSL) and returns JS mirrors of the valley path functions in wgsl/terrain.js so
 // the flight follows the same valley the shaders carve.
 
+import { MOON_DEM } from './moon-data.js';
+import { createCameraRoute } from './camera-route.js';
+import { MOON_SPAN_X, MOON_SPAN_Z } from './planet-terrain.js';
+
 const TAU = Math.PI * 2;
 
 export const SCENES = [
+  // Earth presets retain their original order; the Moon is appended below.
   {
     id: 'pnw',
     name: 'Pacific Northwest',
@@ -164,6 +169,32 @@ export const SCENES = [
   },
 ];
 
+SCENES.push({
+  id: 'moon', name: 'Moon · Copernicus',
+  place: 'Copernicus crater · measured NASA/SELENE terrain',
+  body: { airless: true, radius: MOON_DEM.radius, min: MOON_DEM.min, max: MOON_DEM.max,
+    halfWidth: MOON_SPAN_X / 2, halfHeight: MOON_SPAN_Z / 2 },
+  seed: 0, relief: 7000, ridge: 0, featureScale: 8000, gully: 0,
+  valleyWidth: 0, floodplain: 0, river: 0, floor: 0,
+  path: [0, 0, 0], pathLen: [10000, 10000, 10000], meander: 0, meanderLen: 10000,
+  density: 0, spacing: 15, height: 0, conifer: 0,
+  autumn: 0, treeline: 0, snowline: 100000, clearings: 0,
+  rock: 1, wetland: 0, basin: 0, tropical: 0, mist: 0, mistTop: 0,
+  water: -20000, waterSlope: 0, tannin: 0,
+  flight: { agl: 5500, speed: 180, pitch: -22, fov: 58, startZ: 52000, endZ: -52000,
+    route: createCameraRoute([
+      { x: 14000, z: 52000, agl: 5500, pitch: -20 }, // southern rim approach
+      { x: 5000, z: 38000, agl: 3800, pitch: -25 }, // descend onto the floor
+      { x: -10000, z: 21000, agl: 2400, pitch: -18 }, // western approach to central peaks
+      { x: -9000, z: 6000, agl: 2800, pitch: -18 }, // pass beside the peak cluster
+      { x: 4000, z: -16000, agl: 3400, pitch: -16 }, // cross the northern floor
+      { x: 12000, z: -34000, agl: 5200, pitch: -20 }, // climb over the northern rim
+      { x: 14000, z: -52000, agl: 5500, pitch: -20 }, // exit over the ejecta
+    ]),
+  },
+  sky: { sunElev: 18, sunAzim: 110, haze: 0, clouds: 0, cloudAltitude: 2, veil: 0 },
+});
+
 export function sceneById(id) {
   return SCENES.find((s) => s.id === id) || SCENES[0];
 }
@@ -196,6 +227,10 @@ export function sceneUniforms(f, scene, visit, mul) {
   f[132] = scene.mist * mul.mist; f[133] = scene.mistTop; f[134] = scene.canyon ? 1 : 0; f[135] = seed;
   f[136] = scene.water; f[137] = scene.waterSlope; f[138] = scene.tannin; f[139] = scene.coast ? 1 : 0;
   f[140] = scene.falls || 0; f[141] = scene.fallCliff || 140; f[142] = scene.fallSpacing || 320; f[143] = scene.fallWidth || 1;
+  const body = scene.body;
+  f[144] = body?.airless ? 1 : 0; f[145] = body?.radius ?? 6371000;
+  f[146] = body?.min ?? 0; f[147] = body?.max ?? 0;
+  f[148] = body?.halfWidth ?? 0; f[149] = body?.halfHeight ?? 0; f[150] = 0; f[151] = 0;
 
   const A = scene.path, M = scene.meander;
   const valleyX = (z) => A[0] * Math.sin(k[0] * z + ph[0]) + A[1] * Math.sin(k[1] * z + ph[1]) + A[2] * Math.sin(k[2] * z + ph[2]);

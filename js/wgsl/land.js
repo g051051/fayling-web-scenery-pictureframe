@@ -29,6 +29,13 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 @fragment fn fs(in: VO) -> @location(0) vec4f {
   let dir = normalize(F.camFwd.xyz + in.ndc.x * F.camRight.xyz + in.ndc.y * F.camUp.xyz);
   let pixAng = 2.0 * length(F.camUp.xyz) * F.screen.w;
+  if (F.body.x > 0.5) {
+    // Daylight exposure: black space and an unattenuated solar disk, no Earth moon.
+    let edge = max(pixAng, 0.00001);
+    let angle = acos(clamp(dot(dir, F.sunDir.xyz), -1.0, 1.0));
+    let disk = 1.0 - smoothstep(SUN_ANG_R - edge, SUN_ANG_R + edge, angle);
+    return vec4f(vec3f(disk * F.sunDir.w / (PI * SUN_ANG_R * SUN_ANG_R)), 1.0);
+  }
   var d2 = dir;
   d2.y = max(d2.y, 0.0005);
   d2 = normalize(d2);
@@ -65,7 +72,6 @@ struct ShadowMap { origin: vec2f, texel: f32, span: f32 };
 ` + SKY_RENDER_FUNCS + RAIN_FUNCS + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + /* wgsl */ `
 const AP_N: f32 = ${AP_RES}.0;
 const AP_MAX: f32 = ${AP_MAX_KM}.0;
-const EARTH_R: f32 = 6371000.0;
 
 struct VSOut {
   @builtin(position) pos: vec4f,
@@ -118,7 +124,7 @@ struct VSOut {
   }
   var o: VSOut;
   var rel = vec3f(xz.x + shift.x, y, xz.y + shift.y) - F.camPos.xyz;
-  rel.y -= dot(rel.xz, rel.xz) / (2.0 * EARTH_R);
+  rel.y -= dot(rel.xz, rel.xz) / (2.0 * F.body.y);
   o.rel = rel;
   o.pos = F.viewProj * vec4f(rel, 1.0);
   o.xz = xz;
@@ -143,18 +149,27 @@ fn moonIlluminance() -> vec3f {
 // on coarse clip levels instead of the 2 m map.
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
-  let ceiling = waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0;
+  let ceiling = select(waterLevel(p.z) + F.valley.w + F.relief.x * (1.5 - F.biome.z) + 40.0, F.body.w + 40.0, F.body.x > 0.5);
   var t = 30.0;
   var res = 1.0;
   // Eight steps, stretching faster than the old twelve. The reach is the same few
   // kilometres; the dropped samples were the expensive part of every landscape pixel.
-  for (var i = 0; i < 8; i++) {
+  let steps = select(8, 16, F.body.x > 0.5);
+  for (var i = 0; i < steps; i++) {
     let q = p + L * t;
     if (q.y > ceiling) { break; }
     let texel = max(t * 0.22, 24.0);
-    let lf = clamp(log2(texel / CLIP_T0), 0.0, f32(CLIP_L - 1));
-    let h = clipHeight(q.xz, ceil(lf));
-    let gap = q.y - h;
+    // Distant lunar fragments must use a level that actually contains the sample.
+    var spatialLevel = 0.0;
+    if (F.body.x > 0.5) { spatialLevel = clipFinest(q.xz); }
+    let lf = clamp(max(spatialLevel, log2(texel / CLIP_T0)), 0.0, f32(CLIP_L - 1));
+    // Blend lunar shadow levels too, rather than snapping to the next grid.
+    let sampleLevel = select(ceil(lf), lf, F.body.x > 0.5);
+    let h = clipHeight(q.xz, sampleLevel);
+    // Coarse interpolation can rise above the fine surface. Bias by sample scale
+    // to prevent dotted self-shadows on the measured crater floor.
+    let bias = select(0.0, CLIP_T0 * exp2(sampleLevel) * 0.12, F.body.x > 0.5);
+    let gap = q.y - h + bias;
     res = min(res, gap / (t * 0.05) + 0.5);
     if (res <= 0.0) { return 0.0; }
     t *= 1.72;
@@ -323,6 +338,21 @@ fn groundAlbedo(xz: vec2f, fp: f32, above: f32, dens: f32, rock: f32, snow: f32,
   let grad = A.yz;
   let curv = A.w;
   let Nt = normalize(vec3f(-grad.x, 1.0, -grad.y));
+  if (F.body.x > 0.5) {
+    // Do not extend the crop into invented geography at its boundary.
+    if (any(abs(xz) > F.extent.xy)) { discard; }
+    let L = F.sunDir.xyz;
+    let shadow = terrainShadow(vec3f(xz.x, hT, xz.y) + Nt * 3.0, L);
+    let grain = snoise(xz / 13.0) * (1.0 - smoothstep(3.0, 20.0, fp));
+    // Stylized regolith albedo, not a measured colour map. Heights remain measured.
+    let albedo = vec3f(0.125, 0.122, 0.118) * (1.0 + 0.12 * grain);
+    let incidence = max(dot(Nt, L), 0.0);
+    let direct = F.sunDir.w * incidence * shadow * select(0.0, 1.0, L.y > 0.0) / PI;
+    let col = albedo * (direct + 0.012); // small artistic bounce-light floor
+    if (F.post.w > 3.5) { return vec4f(Nt * 0.5 + 0.5, 1.0); }
+    if (F.post.w > 2.5) { return vec4f(vec3f(shadow), 1.0); }
+    return vec4f(col, 1.0);
+  }
   let wl = waterLevel(xz.y);
   var depth = wl - hT;
   var feeder = false;
