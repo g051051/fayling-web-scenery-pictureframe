@@ -346,6 +346,10 @@ const TREE_RANGE = 6000;
 const TREE_NEAR_DIST = 1800;
 const TREE_MAX = 900000;
 const TREE_NEAR_MAX = 160000;
+// Broadleaf trees inside TREE_CLUMP_DIST are built from separate leaf clumps. They sit in
+// their own list between the near list and the far list.
+const TREE_CLUMP_DIST = 700;
+const TREE_CLUMP_MAX = 60000;
 
 // Per-frame uniform block shared by every render / sky / terrain shader.
 // Layout must match the Float32Array offsets in main.js (writeFrame).
@@ -2402,17 +2406,14 @@ fn treeCell(cell: vec2i, sampleMasks: bool, dens0: f32, conif0: f32) -> Tree {
   t.tint = unit16(h3);
   t.hue = unit16(h3 >> 16u);
   t.seed = f32(h0 & 1023u);
-  // Closed broadleaf stands still meet at the understory, so the canopy stays shut.
-  // Open crowns sit up on a stem. Conifers keep a short skirt and show a trunk in the gaps.
+  // Every hardwood stands on a visible stem with its crown above it. Dropping the crown
+  // to the understory made each one read as a bush or a pod on the ground.
   // Some firs hold a skirt to the ground, some stand on a clear bole.
-  // Broadleaf in a closed stand still come down to the understory so the crowns meet.
-  // Only an open stand lifts the crown onto a stem.
   let coniferStem = t.top * mix(0.05, 0.36, pow(t.tint, 1.4));
-  let broadStem = t.top * mix(0.40, 0.55, t.hue);
-  let meet = min(understoryH(m.x), t.top * 0.72);
-  // Most of a stand stays closed. Only a real gap lifts a hardwood onto a stem.
-  let closed = smoothstep(0.12, 0.42, m.x);
-  t.base = select(mix(broadStem, meet, closed), coniferStem, t.conifer);
+  // A rainforest crown is a shallow umbrella high on a tall straight trunk. A deep crown
+  // that is widest at the top tapers into an inverted cone.
+  let broadStem = t.top * mix(mix(0.22, 0.32, t.hue), mix(0.46, 0.56, t.hue), trop);
+  t.base = select(broadStem, coniferStem, t.conifer);
   if (F.mist.z > 0.5) {
     // juniper: a low rounded shrub, not a spruce on a pole
     t.conifer = false;
@@ -3502,6 +3503,13 @@ const TREE_SEGS_FAR = 6;
 const TREE_CROWN_TRIS_NEAR = (TREE_RINGS_NEAR - 1) * TREE_SEGS_NEAR * 2;
 const TREE_TRUNK_TRIS_NEAR = TREE_TRUNK_SIDES * 2;
 const TREE_VERTS_NEAR = (TREE_CROWN_TRIS_NEAR + TREE_TRUNK_TRIS_NEAR) * 3;
+// clumps: a broadleaf crown is twelve overlapping lumps (an apex, a ring of three, a ring
+// of five and a skirt of three), each an eight-sided ellipsoid in three bands, plus the stem
+const TREE_CLUMPS = 12;
+const TREE_LUMP_SEGS = 8;
+const TREE_LUMP_TRIS = TREE_LUMP_SEGS * 4;
+const TREE_CLUMP_CROWN_TRIS = TREE_CLUMPS * TREE_LUMP_TRIS;
+const TREE_VERTS_CLUMP = (TREE_CLUMP_CROWN_TRIS + TREE_TRUNK_TRIS_NEAR) * 3;
 // far: a cone fan plus a camera-facing stem quad
 const TREE_VERTS_FAR = (TREE_SEGS_FAR + 2) * 3;
 
@@ -3515,6 +3523,13 @@ const TREE_SEGS_NEAR: u32 = ${TREE_SEGS_NEAR}u;
 const TREE_RINGS_NEAR: u32 = ${TREE_RINGS_NEAR}u;
 const TREE_TRUNK_SIDES: u32 = ${TREE_TRUNK_SIDES}u;
 const TREE_SEGS_FAR: u32 = ${TREE_SEGS_FAR}u;
+const TREE_CLUMP_DIST: f32 = ${TREE_CLUMP_DIST}.0;
+const TREE_CLUMP_MAX: u32 = ${TREE_CLUMP_MAX}u;
+const TREE_FAR_MAX: u32 = ${TREE_MAX - TREE_NEAR_MAX - TREE_CLUMP_MAX}u;
+const TREE_CLUMPS: u32 = ${TREE_CLUMPS}u;
+const LUMP_SEGS: u32 = ${TREE_LUMP_SEGS}u;
+const LUMP_TRIS: u32 = ${TREE_LUMP_TRIS}u;
+const CLUMP_CROWN_TRIS: u32 = ${TREE_CLUMP_CROWN_TRIS}u;
 const NEAR_CROWN_TRIS: u32 = ${TREE_CROWN_TRIS_NEAR}u;
 const NEAR_TRUNK_TRIS: u32 = ${TREE_TRUNK_TRIS_NEAR}u;
 struct TreeInst {
@@ -3609,7 +3624,7 @@ struct ShadowMap { origin: vec2f, texel: f32, span: f32 };
 struct GenU { cell0: vec2i, dim: u32, pad: u32 };
 @group(0) @binding(7) var<uniform> G: GenU;
 @group(0) @binding(8) var<storage, read_write> trees: array<TreeInst>;
-@group(0) @binding(9) var<storage, read_write> args: array<atomic<u32>, 8>;
+@group(0) @binding(9) var<storage, read_write> args: array<atomic<u32>, 12>;
 ` + NOISE_WGSL + TERRAIN_FUNCS + clipSampleWGSL(filterA) + FOREST_FUNCS + TREE_CONSTS + /* wgsl */ `
 fn terrainShadow(p: vec3f, L: vec3f) -> f32 {
   if (L.y > 0.8) { return 1.0; }
@@ -3708,11 +3723,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   inst.d = vec4f(stand, 0.0);
   inst.e = vec4f(alb, 0.0);
   if (dist < TREE_NEAR_DIST) {
-    let i = atomicAdd(&args[1], 1u);
-    if (i < TREE_NEAR_MAX) { trees[i] = inst; }
+    // Close broadleaf trees are built from leaf clumps. Firs and juniper keep the shell.
+    if (dist < TREE_CLUMP_DIST && !t.conifer && F.mist.z < 0.5) {
+      let c = atomicAdd(&args[9], 1u);
+      if (c < TREE_CLUMP_MAX) { trees[TREE_NEAR_MAX + c] = inst; }
+    } else {
+      let i = atomicAdd(&args[1], 1u);
+      if (i < TREE_NEAR_MAX) { trees[i] = inst; }
+    }
   } else {
     let j = atomicAdd(&args[5], 1u);
-    if (j < TREE_MAX - TREE_NEAR_MAX) { trees[TREE_MAX - 1u - j] = inst; }
+    if (j < TREE_FAR_MAX) { trees[TREE_MAX - 1u - j] = inst; }
   }
 }
 `;
@@ -3733,6 +3754,7 @@ function treeDrawWGSL() {
 const AP_N: f32 = ${AP_RES}.0;
 const AP_MAX: f32 = ${AP_MAX_KM}.0;
 override FAR: bool = false;
+override LUMP: bool = false;
 
 struct VOut {
   @builtin(position) pos: vec4f,
@@ -3743,7 +3765,47 @@ struct VOut {
   @location(4) yFrac: f32,
   @location(5) crownU: f32,
   @location(6) @interpolate(flat) ti: u32,
+  @location(7) lump: vec2f,   // x = this clump's own brightness, y = occlusion inside the clump
 };
+
+fn lumpH(seed: f32, i: u32, k: u32) -> f32 {
+  return f32(pcgHash(u32(seed) * 2654435761u + i * 40503u + k * 9973u + 17u) & 0xFFFFu) * (1.0 / 65535.0);
+}
+
+// One leaf clump of a broadleaf crown: centre (xz from the trunk, y above the ground),
+// half-width and half-height, a spin for its facets, and a random brightness.
+struct Lump { c: vec3f, rh: f32, rv: f32, rot: f32, rnd: f32 };
+
+// Layers: an apex clump, a ring of three near the top, a ring of five at mid height
+// and three on the skirt. The skirt leaves gaps, so the stem and the sky show through.
+fn lumpOf(i: u32, r: f32, base: f32, top: f32, seed: f32, squash: f32) -> Lump {
+  var layer = 0u;
+  var k = 0u;
+  var n = 1u;
+  if (i >= 1u && i <= 3u) { layer = 1u; k = i - 1u; n = 3u; }
+  else if (i >= 4u && i <= 8u) { layer = 2u; k = i - 4u; n = 5u; }
+  else if (i >= 9u) { layer = 3u; k = i - 9u; n = 3u; }
+  let span = max(top - base, 0.5);
+  var hf = 1.0;
+  var ring = 0.0;
+  if (layer == 1u) { hf = 0.72; ring = 0.40; }
+  else if (layer == 2u) { hf = 0.47; ring = 0.68; }
+  else if (layer == 3u) { hf = 0.22; ring = 0.74; }
+  let j0 = lumpH(seed, i, 0u);
+  let j1 = lumpH(seed, i, 1u);
+  let j2 = lumpH(seed, i, 2u);
+  let a = 6.2831853 * (f32(k) + 0.35 * j0) / f32(n) + f32(layer) * 1.3 + seed * 0.37;
+  let rr = r * ring * (0.9 + 0.2 * j1);
+  var L: Lump;
+  L.rh = r * (0.41 + 0.09 * j2) * select(1.0, 1.1, layer == 0u);
+  L.rv = L.rh * mix(0.86, 0.62, squash);
+  var cy = base + hf * span + (j1 - 0.5) * 0.07 * span;
+  if (layer == 0u) { cy = top - L.rv; }
+  L.c = vec3f(cos(a) * rr, cy, sin(a) * rr);
+  L.rot = 6.2831853 * j0;
+  L.rnd = j2;
+  return L;
+}
 
 // (radius fraction, height fraction). Height is 1 at the apex and 0 at the crown base.
 // The shell stays close to a soft cone or dome. Deep notches read as low-poly spikes
@@ -3765,18 +3827,19 @@ fn crownKnot(ring: u32, conifer: bool, open: f32, trop: f32, juniper: bool) -> v
   // Closed stands stay wide where neighbours meet. An open crown is a spreading
   // oak, wider than it is tall, pinching onto the stem. A sphere on a pole reads as a toy.
   let o = max(open, trop);
-  // Closed: the old wide paraboloid, so neighbouring crowns still make one canopy.
-  let dome = sqrt(max(s, 0.0));
   let spread = sin(3.14159265 * pow(max(s, 0.0), 0.58));
   let z = 0.03 + 0.97 * s;
   var ell = sqrt(max(1.0 - pow(2.0 * z - 1.02, 2.0), 0.0));
   if (trop > 0.01) {
     let zt = pow(s, mix(1.0, 0.62, trop));
     let umb = sqrt(max(1.0 - pow(2.0 * zt - 1.12, 2.0), 0.0));
-    ell = mix(ell, max(umb, ell * 0.9), trop);
+    // The floor keeps the umbrella from tapering to a cone on a thin stem.
+    ell = mix(ell, max(max(umb, ell * 0.9), 0.62), trop);
   }
   let rounded = mix(ell, spread, 0.65);
-  let rad = mix(dome, rounded, o) * smoothstep(0.0, 0.14, s);
+  // Closed hardwoods are an ellipsoid widest in the upper half, the way a real crown holds
+  // its mass. The old paraboloid was widest at the base and read as a pod.
+  let rad = mix(ell, rounded, o) * smoothstep(0.0, 0.14, s);
   let h = mix(1.0 - s, 1.0 - pow(s, mix(1.65, 1.85, trop)), o);
   return vec2f(rad, h);
 }
@@ -3786,7 +3849,12 @@ fn crownOutline(a: f32, seed: f32, ring: u32, conifer: bool, open: f32, juniper:
   let n2 = sin(a * 5.0 + seed * 0.07 + f32(ring));
   if (conifer) { return clamp(1.0 + n1 * 0.07 + n2 * 0.04, 0.88, 1.12); }
   if (juniper) { return clamp(1.0 + n1 * 0.07 + n2 * 0.04, 0.86, 1.12); }
-  return clamp(1.0 + n1 * mix(0.14, 0.22, open) + n2 * 0.06, 0.72, 1.22);
+  // A hardwood is ragged underneath where branches and clumps break the edge, and smoother
+  // on top. The fine ripple sits on the lower crown only.
+  let s = f32(ring) / f32(TREE_RINGS_NEAR - 1u);
+  let n3 = sin(a * 9.0 + seed * 0.31 + f32(ring) * 1.7);
+  let skirt = smoothstep(0.4, 1.0, s);
+  return clamp(1.0 + n1 * mix(0.10, 0.16, open) + n2 * 0.05 + n3 * 0.08 * skirt, 0.72, 1.22);
 }
 
 // Perpendicular of a chord on the crown shell, in (radial, up).
@@ -3806,9 +3874,13 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
   o.yFrac = 0.0;
   o.crownU = 0.0;
   o.ti = 0u;
+  o.lump = vec2f(0.5, 1.0);
   var ti = ii;
-  if (FAR) {
-    if (ii >= TREE_MAX - TREE_NEAR_MAX) { return o; }
+  if (LUMP) {
+    if (ii >= TREE_CLUMP_MAX) { return o; }
+    ti = TREE_NEAR_MAX + ii;
+  } else if (FAR) {
+    if (ii >= TREE_FAR_MAX) { return o; }
     ti = TREE_MAX - 1u - ii;
   } else if (ii >= TREE_NEAR_MAX) {
     return o;
@@ -3839,7 +3911,58 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
   var crownU = 1.0;
   var live = false;
 
-  if (FAR) {
+  if (LUMP && tri < CLUMP_CROWN_TRIS) {
+    live = true;
+    let li = tri / LUMP_TRIS;
+    let lt = tri % LUMP_TRIS;
+    // This corner as (ring 0..3, segment): a top cap, two middle bands and a bottom cap
+    var jr = 0u;
+    var js = 0u;
+    if (lt < LUMP_SEGS) {
+      if (k == 0u) { jr = 0u; js = lt; }
+      else if (k == 1u) { jr = 1u; js = lt; }
+      else { jr = 1u; js = lt + 1u; }
+    } else if (lt < 3u * LUMP_SEGS) {
+      let q = lt - LUMP_SEGS;
+      let sg = q / 2u;
+      if ((q & 1u) == 0u) {
+        if (k == 0u) { jr = 1u; js = sg; }
+        else if (k == 1u) { jr = 2u; js = sg; }
+        else { jr = 2u; js = sg + 1u; }
+      } else {
+        if (k == 0u) { jr = 1u; js = sg; }
+        else if (k == 1u) { jr = 2u; js = sg + 1u; }
+        else { jr = 1u; js = sg + 1u; }
+      }
+    } else {
+      let sg = lt - 3u * LUMP_SEGS;
+      if (k == 0u) { jr = 2u; js = sg; }
+      else if (k == 1u) { jr = 3u; js = sg; }
+      else { jr = 2u; js = sg + 1u; }
+    }
+    let lp = lumpOf(li, r, base, top, seed, max(open * 0.6, trop));
+    let th = 3.14159265 * f32(jr) / 3.0;
+    let ph = 6.2831853 * f32(js % LUMP_SEGS) / f32(LUMP_SEGS) + lp.rot;
+    let u = vec3f(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+    // the wobble depends only on the ring and the angle, so neighbouring facets still meet
+    let wob = 1.0 + 0.10 * sin(ph * 2.0 + lp.rot * 3.0 + f32(jr) * 1.1);
+    let radii = vec3f(lp.rh * wob, lp.rv, lp.rh * wob);
+    let off = lp.c + u * radii;
+    yAbs = off.y;
+    let horiz = vec2f(off.x, off.z) + lean * (yAbs / max(top, 0.5));
+    world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
+    dv = horiz;
+    // Each clump is shaded as a rounded lump, leaning a little toward the crown as a whole
+    // so the tree still reads as one lit mass.
+    let nEll = normalize(u / radii);
+    let dc = off - vec3f(0.0, base + 0.5 * spanH, 0.0);
+    let dcl = length(dc);
+    var nsum = nEll;
+    if (dcl > 1e-3) { nsum = nEll * 0.6 + dc / dcl * 0.4; }
+    if (length(nsum) < 1e-3) { nrm = nEll; } else { nrm = normalize(nsum); }
+    crownU = clamp((yAbs - base) / spanH, 0.0, 1.0);
+    o.lump = vec2f(lp.rnd, mix(0.8, 1.0, smoothstep(-0.7, 0.5, u.y)));
+  } else if (FAR) {
     if (tri < TREE_SEGS_FAR) {
       live = true;
       var si = tri;
@@ -3882,7 +4005,7 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
       bark = 1.0;
       crownU = 0.0;
     }
-  } else if (tri < NEAR_CROWN_TRIS) {
+  } else if (!LUMP && tri < NEAR_CROWN_TRIS) {
     live = true;
     let bandTris = TREE_SEGS_NEAR * 2u;
     let band = tri / bandTris;
@@ -3919,7 +4042,7 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
     crownU = shape.y;
   } else if (base > 1.15 && !juniper) {
     live = true;
-    let ttri = tri - NEAR_CROWN_TRIS;
+    let ttri = tri - select(NEAR_CROWN_TRIS, CLUMP_CROWN_TRIS, LUMP);
     let side = ttri / 2u;
     let second = (ttri & 1u) == 1u;
     var corner = k;
@@ -3930,7 +4053,8 @@ fn knotDelta(p: vec2f, q: vec2f, ang: f32, crownR: f32, span: f32) -> vec3f {
     let a0 = (f32(side) + seed * 0.013) * stepA;
     let ang = select(a0, a0 + stepA, useA1);
     let am = a0 + stepA * 0.5;
-    yAbs = select(0.0, min(base + spanH * 0.04, top * 0.97), topC);
+    // under leaf clumps the stem runs up into the crown, so it shows through the skirt gaps
+    yAbs = select(0.0, min(base + spanH * select(0.04, 0.5, LUMP), top * 0.97), topC);
     let radT = trunkR * select(1.32, 0.6, topC);
     let horiz = vec2f(cos(ang), sin(ang)) * radT + lean * (yAbs / max(top, 0.5));
     world = vec3f(centre.x + horiz.x, centre.y + yAbs, centre.z + horiz.y);
@@ -4021,9 +4145,14 @@ fn shadeSurface(alb: vec3f, nIn: vec3f, V: vec3f, lt: Light, shade: f32, ao: f32
       let aoB = mix(0.48, 1.0, smoothstep(0.0, 0.45, in.yFrac));
       own = shadeSurface(barkC, n, V, lt, sh * sunVis * 0.85, aoB, 0.0, 0.004, 0.72);
     } else {
+      // Broadleaf foliage is sampled by position, not by angle around the trunk: each leaf
+      // clump is its own lump, and an angle has a seam and collapses at the trunk axis.
+      let wy = in.yFrac * top;
+      let wp = vec2f(in.dv.x + wy * 0.4, in.dv.y - wy * 0.35) * (2.4 / max(r, 1.0));
       if (kd > 0.03) {
         let ang = atan2(in.dv.y, in.dv.x);
-        let q = vec2f(ang * select(0.7, 1.1, conifer) + length(in.dv) * 0.08, in.crownU * select(1.8, 2.6, conifer));
+        let qc = vec2f(ang * 1.1 + length(in.dv) * 0.08, in.crownU * 2.6);
+        let q = select(wp, qc, conifer);
         let q2 = q + vec2f(seed * 0.017, seed * 0.008);
         let b1 = gnoised(q2);
         var side = vec3f(-in.dv.y, 0.0, in.dv.x);
@@ -4037,10 +4166,16 @@ fn shadeSurface(alb: vec3f, nIn: vec3f, V: vec3f, lt: Light, shade: f32, ao: f32
       let x = clamp(length(in.dv) / max(r, 0.3), 0.0, 1.35);
       if (kd > 0.02) {
         let ang = atan2(in.dv.y, in.dv.x);
-        let cl = snoise(vec2f(ang * 0.55, in.crownU * 1.6) + vec2f(seed * 0.02, 1.7));
-        let cl2 = snoise(vec2f(ang * 1.4 + x, in.crownU * 2.6) + vec2f(4.0, seed * 0.01));
+        let clA = snoise(vec2f(ang * 0.55, in.crownU * 1.6) + vec2f(seed * 0.02, 1.7));
+        let clB = snoise(vec2f(ang * 1.4 + x, in.crownU * 2.6) + vec2f(4.0, seed * 0.01));
+        let clC = snoise(wp * 0.5 + vec2f(seed * 0.02, 1.7));
+        let clD = snoise(wp * 1.3 + vec2f(4.0, seed * 0.01));
+        let cl = select(clC, clA, conifer);
+        let cl2 = select(clD, clB, conifer);
         alb *= 1.0 + 0.2 * cl + 0.1 * cl2;
       }
+      // each leaf clump has its own brightness (0.5 off the clump mesh leaves it unchanged)
+      alb *= 0.92 + 0.16 * in.lump.x;
       // A little darker toward the stem. Kept mild: a strong dark base reads as a hole
       // in the canopy and breaks a closed stand into separate caps.
       alb *= mix(0.9, 1.04, smoothstep(0.0, 0.75, in.crownU));
@@ -4049,7 +4184,7 @@ fn shadeSurface(alb: vec3f, nIn: vec3f, V: vec3f, lt: Light, shade: f32, ao: f32
       } else {
         alb *= mix(0.92, 1.03, smoothstep(0.0, 0.7, x));
       }
-      let ao = (0.5 + 0.5 * in.crownU) * mix(0.78, 1.05, smoothstep(-0.2, 0.65, n.y));
+      let ao = (0.5 + 0.5 * in.crownU) * mix(0.78, 1.05, smoothstep(-0.2, 0.65, n.y)) * in.lump.y;
       let transK = select(0.26, 0.48, conifer);
       let specK = select(0.015, 0.005, conifer);
       own = shadeSurface(alb, n, V, lt, sh * sunVis, clamp(ao, 0.35, 1.15), transK, specK, select(0.46, 0.6, conifer));
@@ -5825,15 +5960,15 @@ async function main() {
     depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
-  const treePipe = (far) => device.createRenderPipelineAsync({
-    label: far ? 'trees far' : 'trees near', layout: 'auto',
-    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0 } },
+  const treePipe = (far, clump) => device.createRenderPipelineAsync({
+    label: far ? 'trees far' : clump ? 'trees clumps' : 'trees near', layout: 'auto',
+    vertex: { module: treeMod, entryPoint: 'vs', constants: { FAR: far ? 1 : 0, LUMP: clump ? 1 : 0 } },
     fragment: { module: treeMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
   });
-  const [treeNearPipe, treeFarPipe] = await Promise.all([treePipe(false), treePipe(true)]);
+  const [treeNearPipe, treeFarPipe, treeClumpPipe] = await Promise.all([treePipe(false, false), treePipe(true, false), treePipe(false, true)]);
   await paintLoad('Preparing the sky', 0.82);
   const skyPipe = await device.createRenderPipelineAsync({
     label: 'sky', layout: 'auto',
@@ -5916,15 +6051,15 @@ async function main() {
     shadowView, { buffer: shadowUBO }, reflView, reflSamp], 'land');
   // Instanced trees: a list written by a compute pass and drawn with two indirect draws.
   const treeBuf = mkBuf(TREE_MAX * TREE_INST_BYTES, GU.STORAGE, 'trees');
-  const treeArgs = mkBuf(32, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
-  const treeArgsRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'tree args read');
+  const treeArgs = mkBuf(48, GU.STORAGE | GU.INDIRECT | GU.COPY_DST | GU.COPY_SRC, 'tree args');
+  const treeArgsRead = mkBuf(48, GU.MAP_READ | GU.COPY_DST, 'tree args read');
   const treeLight = mkBuf(128, GU.STORAGE, 'tree light');
   const treeGenUBO = mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'tree gen');
   const treeGenData = new ArrayBuffer(16);
   const treeGenI = new Int32Array(treeGenData), treeGenU = new Uint32Array(treeGenData);
-  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0]);
+  const treeArgsInit = new Uint32Array([TREE_VERTS_NEAR, 0, 0, 0, TREE_VERTS_FAR, 0, 0, 0, TREE_VERTS_CLUMP, 0, 0, 0]);
   let treeArgsPending = false;
-  window.__trees = [0, 0];
+  window.__trees = [0, 0, 0];
   const bgTreeLight = bg(treeLightPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, { buffer: rainUBO }, { buffer: treeLight }], 'tree light');
   const bgTreeGen = bg(treeGenPipe, [{ buffer: frameUBO }, sampClamp, arr(clipA), arr(clipB), { buffer: clipUBO },
     shadowView, { buffer: shadowUBO }, { buffer: treeGenUBO }, { buffer: treeBuf }, { buffer: treeArgs }, { buffer: treeLight }], 'tree gen');
@@ -5933,6 +6068,7 @@ async function main() {
     { binding: 10, resource: { buffer: treeLight } }];
   const bgTreeNear = device.createBindGroup({ label: 'trees near', layout: treeNearPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgTreeFar = device.createBindGroup({ label: 'trees far', layout: treeFarPipe.getBindGroupLayout(0), entries: treeEntries });
+  const bgTreeClump = device.createBindGroup({ label: 'trees clumps', layout: treeClumpPipe.getBindGroupLayout(0), entries: treeEntries });
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp, starView, { buffer: rainUBO }], 'sky');
   const bgRainInit = bg(rainInitPipe, [{ buffer: rainUBO }, { buffer: dropBuf }], 'rain init');
   const bgRainDrop = bg(rainDropPipe, [{ buffer: rainUBO }, { buffer: frameUBO }, { buffer: dropBuf }], 'rain drop');
@@ -8976,6 +9112,9 @@ async function main() {
     rp.setPipeline(treeNearPipe);
     rp.setBindGroup(0, bgTreeNear);
     rp.drawIndirect(treeArgs, 0);
+    rp.setPipeline(treeClumpPipe);
+    rp.setBindGroup(0, bgTreeClump);
+    rp.drawIndirect(treeArgs, 32);
     rp.setPipeline(treeFarPipe);
     rp.setBindGroup(0, bgTreeFar);
     rp.drawIndirect(treeArgs, 16);
@@ -9022,7 +9161,7 @@ async function main() {
     if (doProbe) enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, PROBE_N * 4);
     let doTreeRead = false;
     if (!treeArgsPending && (frameIndex & 63) === 0) {
-      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 32);
+      enc.copyBufferToBuffer(treeArgs, 0, treeArgsRead, 0, 48);
       doTreeRead = true;
     }
     let doTs = false;
@@ -9045,7 +9184,7 @@ async function main() {
       treeArgsPending = true;
       treeArgsRead.mapAsync(GPUMapMode.READ).then(() => {
         const a = new Uint32Array(treeArgsRead.getMappedRange());
-        window.__trees = [a[1], a[5]];
+        window.__trees = [a[1], a[5], a[9]];
         treeArgsRead.unmap();
         treeArgsPending = false;
       }, () => { treeArgsPending = false; });
